@@ -14,6 +14,7 @@ import os
 import re
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 MAX_CABS = 512
@@ -21,6 +22,9 @@ MAX_FILES = 20_000
 MAX_NAME_BYTES = 4096
 MAX_FOLDERS = 256
 CAB_MIN_HEADER = 36
+SEVEN_ZIP_MAGIC = b'7z\xbc\xaf\x27\x1c'
+SEVEN_ZIP_MIN_HEADER = 32
+MAX_SEVEN_ZIPS = 128
 
 
 def _u16(data: mmap.mmap | bytes, offset: int) -> int:
@@ -176,6 +180,60 @@ def find_cabinets(data: mmap.mmap | bytes) -> list[dict]:
     return result
 
 
+
+def inspect_7z(data: mmap.mmap | bytes, start: int) -> dict | None:
+    """Verify the 7z signature header and next-header CRC, not archive members."""
+    if start < 0 or len(data) - start < SEVEN_ZIP_MIN_HEADER:
+        return None
+    if data[start:start + 6] != SEVEN_ZIP_MAGIC:
+        return None
+    # The original 7z specification uses major format version zero.
+    major, minor = data[start + 6], data[start + 7]
+    if major != 0:
+        return None
+    stored_start_crc = _u32(data, start + 8)
+    if zlib.crc32(data[start + 12:start + 32]) != stored_start_crc:
+        return None
+    next_offset, next_size, next_crc = struct.unpack_from('<QQI', data, start + 12)
+    next_start = start + SEVEN_ZIP_MIN_HEADER + next_offset
+    if next_start > len(data) or next_size > len(data) - next_start:
+        return None
+    # An empty next-header cannot independently establish archive contents.
+    if next_size == 0:
+        return None
+    if zlib.crc32(data[next_start:next_start + next_size]) != next_crc:
+        return None
+    return {
+        'offset': start,
+        'length': SEVEN_ZIP_MIN_HEADER + next_offset + next_size,
+        'format_version': f'{major}.{minor}',
+        'next_header_offset': next_offset,
+        'next_header_size': next_size,
+        'start_header_crc32': f'{stored_start_crc:08x}',
+        'next_header_crc32': f'{next_crc:08x}',
+        'header_crc_verified': True,
+        'metadata_only': True,
+        'file_names_available': False,
+        'file_contents_verified': False,
+    }
+
+
+def find_7z_archives(data: mmap.mmap | bytes) -> list[dict]:
+    """Find CRC-verified 7z byte ranges embedded in an arbitrary input file."""
+    result = []
+    cursor = 0
+    while len(result) < MAX_SEVEN_ZIPS:
+        at = data.find(SEVEN_ZIP_MAGIC, cursor)
+        if at < 0:
+            break
+        archive = inspect_7z(data, at)
+        if archive:
+            result.append(archive)
+            cursor = at + archive['length']
+        else:
+            cursor = at + len(SEVEN_ZIP_MAGIC)
+    return result
+
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open('rb') as handle:
@@ -195,17 +253,21 @@ def inspect(path: Path, carve_dir: Path | None = None) -> dict:
         source.seek(0)
         with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
             cabs = find_cabinets(data)
+            archives_7z = find_7z_archives(data)
             info = {'schema': 'rea-windows-legacy-inventory-v1', 'input_name': path.name,
                     'bytes': len(data), 'sha256': _hash_file(path),
                     'pe': pe_info(data), 'cabinet_count': len(cabs), 'cabinets': cabs,
+                    'seven_zip_count': len(archives_7z), 'seven_zip_archives': archives_7z,
                     'limitations': ['CAB metadata is not decompressed or authenticated',
+                                    '7z archive header CRCs are verified, but members are not decoded',
                                     'PE classification does not prove runtime behavior',
                                     'No installer or extracted program was executed']}
-            if carve_dir is not None and cabs:
+            if carve_dir is not None and (cabs or archives_7z):
                 carve_dir.mkdir(parents=True, exist_ok=True)
-                for item in cabs:
+                for item in [*cabs, *archives_7z]:
                     name = re.sub(r'[^A-Za-z0-9._-]+', '_', path.stem)[:90]
-                    dst = carve_dir / f'{name}_{item["offset"]:08x}.cab'
+                    extension = '.7z' if item in archives_7z else '.cab'
+                    dst = carve_dir / f'{name}_{item["offset"]:08x}{extension}'
                     # Exclusive creation: never overwrite existing evidence.
                     with dst.open('xb') as target:
                         off = item['offset']
@@ -222,8 +284,8 @@ def inspect(path: Path, carve_dir: Path | None = None) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('input', type=Path, help='Windows installer EXE or standalone CAB file')
-    parser.add_argument('--carve-dir', type=Path, help='Opt-in directory to save CAB copies (never overwrite)')
+    parser.add_argument('input', type=Path, help='Windows installer EXE, standalone CAB, or 7z')
+    parser.add_argument('--carve-dir', type=Path, help='Opt-in directory for CAB/7z copies (never overwrite)')
     parser.add_argument('--json', action='store_true', help='Emit machine-readable inventory')
     args = parser.parse_args(argv)
     try:
@@ -234,13 +296,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print(f'{report["input_name"]}: {report["bytes"]} bytes; SHA256 {report["sha256"]}')
-        print(f'PE: {report["pe"]}; top-level CABs: {report["cabinet_count"]}')
+        print(f'PE: {report["pe"]}; CABs: {report["cabinet_count"]}; 7z: {report["seven_zip_count"]}')
         for cab in report['cabinets']:
             print(f'  CAB at {cab["offset"]}: {cab["length"]} bytes, {cab["file_count"]} entries')
             for entry in cab['files']:
                 print(f'    {entry["name"]} ({entry["uncompressed_size"]} bytes)')
             if 'carved_file' in cab:
                 print(f'  Carved: {cab["carved_file"]}')
+        for archive in report['seven_zip_archives']:
+            print(f'  7z at {archive["offset"]}: {archive["length"]} bytes, header CRC verified')
+            if 'carved_file' in archive:
+                print(f'  Carved: {archive["carved_file"]}')
     return 0
 
 
