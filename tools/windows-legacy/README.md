@@ -6,11 +6,11 @@ This folder extends the **source repository workflow**, not REA's published CLI/
 
 Run from the repository root with Python 3.10+:
 
-~~~powershell
+```powershell
 python tools/windows-legacy/doctor.py --json
 python tools/windows-legacy/inspect_installer.py "C:\samples\legacy-setup.exe" --json > installer-inventory.json
 python tools/windows-legacy/inspect_installer.py "C:\samples\legacy-setup.exe" --carve-dir "C:\analysis\cabs" --json > carved-manifest.json
-~~~
+```
 
 The inspector validates basic PE/CAB metadata, inventories CAB entry names and uncompressed sizes, calculates SHA-256 hashes, and optionally **carves** embedded CABs (as .cab files) without running the installer. CAB members are **not** decompressed or verified. Existing carved files are never overwritten.
 
@@ -20,16 +20,16 @@ For a standalone CAB, point the inspector directly at that file. For installers 
 
 First review the JSON inventory and cabinet entry names. Microsoft Windows includes **expand.exe**. To list members without extraction:
 
-~~~powershell
+```powershell
 expand -d "C:\analysis\cabs\legacy-setup_00012345.cab"
-~~~
+```
 
 After checking entry names for absolute paths, traversal, collisions and suspicious contents, create a *new isolated directory*, then decompress a selected CAB. Replace the example filename with the actual **carved_file** path in the JSON manifest:
 
-~~~powershell
+```powershell
 New-Item -ItemType Directory -Path "C:\analysis\unpacked" -ErrorAction Stop
 expand "C:\analysis\cabs\legacy-setup_00012345.cab" -F:* "C:\analysis\unpacked"
-~~~
+```
 
 Decompression is deliberately not automated by this script. The extracted binaries are **untrusted**. Do not launch them or register their DLL/OCX components.
 
@@ -37,20 +37,20 @@ Decompression is deliberately not automated by this script. The extracted binari
 
 Use REA **on your own Windows PC**, with a compatible Node version, Ghidra and a supported JDK. Use REA's doctor before native analysis:
 
-~~~powershell
+```powershell
 rea providers --json
 rea doctor --provider ghidra --json
 rea inspect "C:\analysis\unpacked\monitordeproduccionpro.exe" --provider ghidra --json > native-inventory.json
 rea search "C:\analysis\unpacked\monitordeproduccionpro.exe" "VFP" --provider ghidra --json > native-references.json
-~~~
+```
 
 **Visual FoxPro 9 caveat:** the EXE can contain compiled FoxPro application data; Ghidra does not automatically reconstruct FoxPro source from the native runtime. An independently maintained, optional VFP-specific tool is [FoxLift](https://pypi.org/project/foxlift/) (for authorized analysis, for example: foxlift inspect app.exe --json). FoxLift is alpha-stage and AGPL-3.0-only. It is **not installed, bundled, endorsed, or copied** here. Review the exact release, its license, security, and verification output independently.
 
 ## Regression tests
 
-~~~powershell
+```powershell
 python -m unittest discover -s tools/windows-legacy -p "test_*.py" -v
-~~~
+```
 
 All fixtures are synthetic; no vendor executable is used in the tests.
 
