@@ -66,11 +66,11 @@ def path_risks(name: str) -> list[str]:
     if not name or name.startswith(('/', '\\')) or re.match(r'^[A-Za-z]:', name):
         risks.append('absolute_or_drive_path')
     parts = re.split(r'[\\/]', name)
-    if '..' in parts or '.' in parts or '' in parts:
+    if '..' in parts or '' in parts:
         risks.append('traversal_or_ambiguous_segments')
     if any(':' in part for part in parts):
         risks.append('alternate_data_stream_or_colon')
-    if any(part.rstrip(' .') != part for part in parts):
+    if any(part not in ('.', '..') and part.rstrip(' .') != part for part in parts):
         risks.append('trailing_dot_or_space')
     if any(re.match(r'(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)', part) for part in parts):
         risks.append('reserved_device_name')
@@ -144,7 +144,7 @@ def inspect_cab(data: mmap.mmap | bytes, start: int) -> dict | None:
             raw_name, cursor = _read_cstring(data, cursor + 16, end)
             name = raw_name.decode('utf-8' if attributes & 0x80 else 'cp1252', errors='replace')
             risks = path_risks(name)
-            normalized = name.replace('\\', '/').casefold()
+            normalized = '/'.join(part.casefold() for part in name.replace('\\', '/').split('/') if part != '.')
             if normalized in seen_names:
                 risks.append('case_insensitive_name_collision')
             seen_names.add(normalized)
