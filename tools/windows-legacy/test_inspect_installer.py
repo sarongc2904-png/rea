@@ -68,6 +68,11 @@ class InspectorTests(unittest.TestCase):
         found = mod.find_cabinets(cab(('folder\\A.EXE', 'folder/a.exe')))[0]
         self.assertIn('case_insensitive_name_collision', found['files'][1]['path_risks'])
 
+    def test_normal_windows_dot_prefix_is_not_flagged(self):
+        found = mod.find_cabinets(cab(('.\\logo.bmp', 'logo.bmp')))[0]
+        self.assertEqual(found['files'][0]['path_risks'], [])
+        self.assertIn('case_insensitive_name_collision', found['files'][1]['path_risks'])
+
     def test_invalid_windows_member_path_indicators(self):
         self.assertIn('alternate_data_stream_or_colon', mod.path_risks('name:stream'))
         self.assertIn('trailing_dot_or_space', mod.path_risks('name.'))
