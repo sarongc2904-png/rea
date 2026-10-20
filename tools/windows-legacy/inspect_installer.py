@@ -59,6 +59,28 @@ def pe_info(data: mmap.mmap | bytes) -> dict | None:
             'subsystem': subsystem}
 
 
+
+def path_risks(name: str) -> list[str]:
+    """Conservative Windows extraction warnings; no path is actually used."""
+    risks = []
+    if not name or name.startswith(('/', '\\')) or re.match(r'^[A-Za-z]:', name):
+        risks.append('absolute_or_drive_path')
+    parts = re.split(r'[\\/]', name)
+    if '..' in parts or '.' in parts or '' in parts:
+        risks.append('traversal_or_ambiguous_segments')
+    if any(':' in part for part in parts):
+        risks.append('alternate_data_stream_or_colon')
+    if any(part.rstrip(' .') != part for part in parts):
+        risks.append('trailing_dot_or_space')
+    if any(re.match(r'(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)', part) for part in parts):
+        risks.append('reserved_device_name')
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        risks.append('control_character')
+    if any(ch in '<>"|?*' for ch in name):
+        risks.append('invalid_windows_filename_character')
+    return risks
+
+
 def inspect_cab(data: mmap.mmap | bytes, start: int) -> dict | None:
     """Parse CAB metadata and entry names, but do not decompress or execute data."""
     n = len(data)
@@ -110,6 +132,7 @@ def inspect_cab(data: mmap.mmap | bytes, start: int) -> dict | None:
             return None
         cursor = start + coff_files
         entries = []
+        seen_names = set()
         for _ in range(files):
             if cursor + 16 > end:
                 return None
@@ -120,10 +143,16 @@ def inspect_cab(data: mmap.mmap | bytes, start: int) -> dict | None:
                 return None
             raw_name, cursor = _read_cstring(data, cursor + 16, end)
             name = raw_name.decode('utf-8' if attributes & 0x80 else 'cp1252', errors='replace')
+            risks = path_risks(name)
+            normalized = name.replace('\\', '/').casefold()
+            if normalized in seen_names:
+                risks.append('case_insensitive_name_collision')
+            seen_names.add(normalized)
             entries.append({'name': name, 'uncompressed_size': size,
-                            'folder_index': folder_index})
+                            'folder_index': folder_index, 'path_risks': risks})
         return {'offset': start, 'length': length, 'file_count': files,
                 'folder_count': folders, 'folders': folder_list, 'files': entries,
+                'unsafe_name_count': sum(bool(x['path_risks']) for x in entries),
                 'metadata_only': True, 'contents_verified': False}
     except (IndexError, ValueError, struct.error, OverflowError):
         return None
