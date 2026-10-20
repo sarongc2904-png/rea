@@ -42,6 +42,15 @@ def mz_prefix():
     return bytes(b)
 
 
+def synthetic_7z(payload=b'abcde', next_header=b'\x01\x00\x00'):
+    """Synthetic 7z-style start and next header; no executable archive member."""
+    import zlib
+    next_offset = len(payload)
+    start_fields = struct.pack('<QQI', next_offset, len(next_header), zlib.crc32(next_header))
+    start_crc = zlib.crc32(start_fields)
+    return b'7z\xbc\xaf\x27\x1c' + bytes([0, 4]) + struct.pack('<I', start_crc) + start_fields + payload + next_header
+
+
 class InspectorTests(unittest.TestCase):
     def test_parses_pe(self):
         self.assertEqual(mod.pe_info(mz_prefix())['machine'], 'x86')
@@ -112,6 +121,45 @@ class InspectorTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 mod.inspect(item, directory)
             self.assertEqual(filename.read_bytes(), cab())
+
+    def test_detects_embedded_7z_with_verified_header_crcs(self):
+        archive = synthetic_7z(b'compressed-data', b'\x01\x04\x11')
+        found = mod.find_7z_archives(mz_prefix() + archive + b'trailer')
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]['offset'], len(mz_prefix()))
+        self.assertEqual(found[0]['length'], len(archive))
+        self.assertTrue(found[0]['header_crc_verified'])
+        self.assertFalse(found[0]['file_contents_verified'])
+
+    def test_rejects_false_7z_signature_and_corrupt_crc(self):
+        archive = bytearray(synthetic_7z())
+        archive[8] ^= 1
+        self.assertEqual(mod.find_7z_archives(bytes(archive)), [])
+        archive = bytearray(synthetic_7z())
+        archive[-1] ^= 1
+        self.assertEqual(mod.find_7z_archives(bytes(archive)), [])
+
+    def test_rejects_7z_out_of_bounds(self):
+        archive = bytearray(synthetic_7z())
+        fields = struct.pack('<QQI', 999999999, 3, 0)
+        import zlib
+        archive[12:32] = fields
+        struct.pack_into('<I', archive, 8, zlib.crc32(fields))
+        self.assertEqual(mod.find_7z_archives(bytes(archive)), [])
+
+    def test_carves_valid_7z_and_refuses_overwrite(self):
+        payload = synthetic_7z()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'sample.exe'
+            path.write_bytes(mz_prefix() + payload)
+            output = Path(temp) / 'carved'
+            report = mod.inspect(path, output)
+            self.assertEqual(report['seven_zip_count'], 1)
+            created = Path(report['seven_zip_archives'][0]['carved_file'])
+            self.assertEqual(created.suffix, '.7z')
+            self.assertEqual(created.read_bytes(), payload)
+            with self.assertRaises(FileExistsError):
+                mod.inspect(path, output)
 
     def test_no_empty_input(self):
         with tempfile.TemporaryDirectory() as temp:
