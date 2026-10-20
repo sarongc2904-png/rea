@@ -28,10 +28,3 @@ jobs:
         run: python -m unittest discover -s tools/windows-legacy -p "test_*.py" -v
       - name: Run read-only prerequisite discovery
         run: python tools/windows-legacy/doctor.py --json
-      - name: Preview canonical Markdown formatter output
-        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
-        shell: bash
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          ./node_modules/.bin/oxfmt tools/windows-legacy/README.md
-          git --no-pager diff -- tools/windows-legacy/README.md
