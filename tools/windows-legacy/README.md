@@ -24,7 +24,7 @@ First review the JSON inventory and cabinet entry names. Microsoft Windows inclu
 expand -d "C:\analysis\cabs\legacy-setup_00012345.cab"
 ```
 
-After checking entry names for absolute paths, traversal, collisions and suspicious contents, create a *new isolated directory*, then decompress a selected CAB. Replace the example filename with the actual **carved_file** path in the JSON manifest:
+After checking entry names for absolute paths, traversal, collisions and suspicious contents, create a _new isolated directory_, then decompress a selected CAB. Replace the example filename with the actual **carved_file** path in the JSON manifest:
 
 ```powershell
 New-Item -ItemType Directory -Path "C:\analysis\unpacked" -ErrorAction Stop
@@ -59,6 +59,7 @@ All fixtures are synthetic; no vendor executable is used in the tests.
 - Tools here use static reads only; they do **not** execute targets, extract DLLs, install packages, or contact the network.
 - Basic PE classification does not establish signature validity, packer behavior, vulnerability or program behavior.
 - CAB entries are parsed as untrusted metadata. The code does not check full archive integrity, CFData checksums, spanned CAB chain correctness, or decompression.
+- CAB members expose `path_risks` and per-archive `unsafe_name_count`; warnings are conservative, not proof of a malicious installer.
 - A successful carve proves only that the selected byte range was copied. Use separate format-specific tools to inspect it.
 - Avoid uploading original commercial binaries, protected assets, proprietary source, reverse-engineered source or leaked secrets to public repositories.
 - Perform analyses only where you own the software or have authorization; implement new features independently rather than reusing proprietary code or media.
