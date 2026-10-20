@@ -1,0 +1,30 @@
+name: Legacy Windows installer tools
+
+on:
+  pull_request:
+    paths:
+      - "tools/windows-legacy/**"
+      - ".github/workflows/legacy-windows-tools.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-tests:
+    name: Synthetic CAB/PE tests (Python test matrix)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run standard-library regression suite (no vendor binaries)
+        run: python -m unittest discover -s tools/windows-legacy -p "test_*.py" -v
+      - name: Run read-only prerequisite discovery
+        run: python tools/windows-legacy/doctor.py --json
