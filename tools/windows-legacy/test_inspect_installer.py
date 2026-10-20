@@ -55,6 +55,24 @@ class InspectorTests(unittest.TestCase):
         self.assertEqual([e['name'] for e in found[0]['files']], ['one.dll','two.exe'])
         self.assertFalse(found[0]['contents_verified'])
 
+    def test_suspicious_cab_paths_are_flagged_without_extraction(self):
+        names = ('../escape.exe', 'C:\\outside.exe', 'NUL.txt', 'valid\\module.dll')
+        found = mod.find_cabinets(cab(names))[0]
+        self.assertEqual(found['unsafe_name_count'], 3)
+        self.assertIn('traversal_or_ambiguous_segments', found['files'][0]['path_risks'])
+        self.assertIn('absolute_or_drive_path', found['files'][1]['path_risks'])
+        self.assertIn('reserved_device_name', found['files'][2]['path_risks'])
+        self.assertEqual(found['files'][3]['path_risks'], [])
+
+    def test_possible_case_insensitive_collision(self):
+        found = mod.find_cabinets(cab(('folder\\A.EXE', 'folder/a.exe')))[0]
+        self.assertIn('case_insensitive_name_collision', found['files'][1]['path_risks'])
+
+    def test_invalid_windows_member_path_indicators(self):
+        self.assertIn('alternate_data_stream_or_colon', mod.path_risks('name:stream'))
+        self.assertIn('trailing_dot_or_space', mod.path_risks('name.'))
+        self.assertIn('invalid_windows_filename_character', mod.path_risks('a?.exe'))
+
     def test_rejects_out_of_bounds_claim(self):
         self.assertEqual(mod.find_cabinets(cab(corrupt=True)), [])
 
