@@ -12,7 +12,7 @@ python tools/windows-legacy/inspect_installer.py "C:\samples\legacy-setup.exe" -
 python tools/windows-legacy/inspect_installer.py "C:\samples\legacy-setup.exe" --carve-dir "C:\analysis\cabs" --json > carved-manifest.json
 ```
 
-The inspector validates basic PE/CAB metadata, inventories CAB entry names and uncompressed sizes, calculates SHA-256 hashes, and optionally **carves** embedded CABs (as .cab files) without running the installer. CAB members are **not** decompressed or verified. Existing carved files are never overwritten.
+The inspector validates basic PE/CAB/7z metadata, inventories CAB entry names and uncompressed sizes, calculates SHA-256 hashes, and optionally **carves** embedded CAB/7z containers (as .cab files) without running the installer. CAB members are **not** decompressed or verified. Existing carved files are never overwritten.
 
 For a standalone CAB, point the inspector directly at that file. For installers without recognizable CABs, a zero-CAB result does not mean the installer is empty: MSI, 7z, Inno Setup, NSIS and proprietary/encrypted formats require separate tools.
 
@@ -66,3 +66,42 @@ All fixtures are synthetic; no vendor executable is used in the tests.
 - For native limitations on Windows, read [Windows Ghidra P0](../../docs/windows-ghidra-p0.md) and [Native analysis](../../docs/native-investigation.md).
 
 **No changes to REA core, npm package, MCP registry, installed agent configurations, or any production system are made by these companion scripts.**
+
+## Embedded 7z containers (legacy mobile installers)
+
+The inspector also recognizes 7z archives with valid signatures, start-header
+CRC32, in-range next header, and matching next-header CRC32. This verifies the
+container metadata but NOT the integrity, safety or decompression of members.
+The JSON report adds seven_zip_count and seven_zip_archives.
+
+To inspect a legacy installer:
+
+```powershell
+python tools/windows-legacy/inspect_installer.py "C:\samples\mobile-setup.exe" --json
+python tools/windows-legacy/inspect_installer.py "C:\samples\mobile-setup.exe" --carve-dir "C:\analysis\carved" --json
+```
+
+The optional carve saves only original CAB/7z bytes; it never overwrites
+existing files. Once inspected, use a separate installed tool such as 7-Zip
+to manually list members in an isolated analysis folder. Never execute
+vendor installers or extracted binaries merely to inventory packages.
+
+## Android APK analysis with existing REA/JADX integration
+
+REA already supports Android APK analysis using a separately configured
+JADX engine. See the authoritative Android guide:
+[Android analysis](../../docs/android-analysis.md).
+
+Use Node supported by REA, a full JDK 17+, and a manually installed pinned
+REA_JADX_MCP_JAR. Verify the exact jar SHA-256 as instructed by that guide.
+
+```powershell
+python tools/windows-legacy/doctor.py --json
+rea doctor --json
+rea inspect-android-package "C:\samples\comandero.apk"
+rea search-android-classes "C:\samples\comandero.apk" Comanda
+```
+
+Doctor's path discovery does not attest version, checksum, runtime
+compatibility, APK authenticity, or network behavior. Do not include
+commercial APKs/EXEs in Git commits or run them on the analysis workstation.
