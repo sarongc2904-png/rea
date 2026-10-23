@@ -1,7 +1,7 @@
 <div align="center">
 
 [English](../../README.md) · [简体中文](README_zh.md) · [繁體中文](README_zh-TW.md) · [日本語](README_ja.md) · [한국어](README_ko.md) · [Türkçe](README_tr.md) · [Русский](README_ru.md) · [Tiếng Việt](README_vi.md) · [ไทย](README_th.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [Français](README_fr.md) · [Українська](README_uk.md) · [Polski](README_pl.md) · [Português (Brasil)](README_pt-BR.md) · [العربية](README_ar.md) · [فارسی](README_fa.md) · [Bahasa Indonesia](README_id.md) · [Italiano](README_it.md)
-· [Ελληνικά](README_el.md) · **മലയാളം**
+· [Ελληνικά](README_el.md) · **മലയാളം** · [Roman Urdu](README_ur-Latn.md)
 
 # REA: എന്തും Reverse Engineer ചെയ്യുക
 
@@ -143,7 +143,7 @@ Target പരിശോധിക്കാനും പ്രസക്തമായ
 
 ## എന്തൊക്കെ വിശകലനം ചെയ്യാം
 
-REA-യ്ക്ക് Node.js 22.x (>=22.19), 24.x (>=24.11), അല്ലെങ്കിൽ 26+ പതിപ്പും npm-ഉം ആവശ്യമാണ്. Target അനുസരിച്ച് അധിക tools-ഉം host support-ഉം വ്യത്യാസപ്പെടും:
+REA-യ്ക്ക് Node.js 22.x (>=22.23.4), 24.x (>=24.22.1), അല്ലെങ്കിൽ 26+ (>=26.12.1) പതിപ്പും npm-ഉം ആവശ്യമാണ്. Target അനുസരിച്ച് അധിക tools-ഉം host support-ഉം വ്യത്യാസപ്പെടും:
 
 | Target                 | REA നൽകുന്ന ഫലങ്ങൾ                                                                     | ആവശ്യകതകളും ഗൈഡും                                                                                                                    |
 | ---------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
@@ -151,14 +151,19 @@ REA-യ്ക്ക് Node.js 22.x (>=22.19), 24.x (>=24.11), അല്ലെ�
 | Offline ELF layout     | Sections, segments, യഥാർത്ഥ symbols/relocations, static mitigation candidates         | Linux x64-ൽ caller നൽകുന്ന pwntools; [binary diagnostics](../binary-diagnostics.md)                                                 |
 | Go binaries            | ഉൾച്ചേർത്ത compiler version, modules, replacements, build settings                    | Built-in static ELF/PE/thin Mach-O പരിശോധന; Go installation ആവശ്യമില്ല                                                              |
 | Rust binaries          | ഉൾച്ചേർത്ത cargo-auditable crate പേരുകൾ, versions, sources, dependency edges           | Built-in static ELF/PE/thin Mach-O പരിശോധന; [Rust binaries](../rust-binaries.md)                                                  |
+| PE certificates        | Authenticode WIN_CERTIFICATE entries and PKCS#7 signer/X.509 identity fields        | Built-in static PE inspection; [PE certificates](../pe-certificates.md)                                                           |
+| ELF notes              | PT_NOTE/SHT_NOTE owners, types, GNU build-id and ABI-tag fields                     | Built-in static ELF inspection; [ELF notes](../elf-notes.md)                                                                      |
+| Erlang BEAM            | IFF chunks, atoms, exports, and tables                                              | Built-in static BEAM inspection; [Erlang BEAM](../erlang-beam.md)                                                                 |
 | WASM artifact          | Validation, sections, കൃത്യമായ import/export WAT രൂപങ്ങൾ, decoded WAT                    | Caller നൽകുന്ന WABT 1.0.42; `inspect_wasm_artifact`                                                                                 |
 | EVM bytecode           | Dispatch selectors, byte offsets, അനുമാനിച്ച arguments, mutability                     | Linux x64-ൽ local raw/hex carrier; [offline EVM guide](../evm-bytecode.md)                                                        |
 | SQLite databases       | Tables, columns, indexes, views, triggers, തിരഞ്ഞെടുത്ത സാധാരണ table rows                | Local database/WAL snapshot; native SQLite പരിമിതികളോടെ Node.js 24.x >=24.15 അല്ലെങ്കിൽ 26+                                         |
 | Recorded Linux crashes | Raw notes, രേഖപ്പെടുത്തിയ ഓരോ thread-ന്റെയും registers/signals, ഐച്ഛിക mapping candidates | Linux x64-ൽ caller നൽകുന്ന pwntools; ഐച്ഛിക GDB/pwndbg; [recorded crashes](../recorded-crashes.md)                                   |
+| ഡെസ്ക്ടോപ്പ് ഇൻസ്റ്റലേഷനുകൾ   | റൺടൈം സാധ്യതകൾ, തെളിവ് ഫയലുകൾ, ഘടക സൂചനകൾ, തുടർ നടപടികൾ                                   | പരിധിയുള്ള ഡയറക്ടറി, ഹെഡർ പരിശോധന；[ഡെസ്ക്ടോപ്പ് ആപ്ലിക്കേഷനുകൾ](../desktop-applications.md)                                                |
 | JavaScript / Electron  | Modules, imports, source maps, routes, IPC, native add-on ബന്ധങ്ങൾ                    | Node.js, npm; Linux: procps-compatible `ps`; [application analysis](../javascript-application-workflows.md)                       |
 | Websites               | Page structure, scripts, network observations, ആവശ്യപ്പെട്ട screenshots                | Chrome-family browser; [browser analysis](../browser-observation.md)                                                              |
 | Saved network captures | Requests, responses, പുറത്തുകാണുന്ന payload-ുകൾ, source locations                          | HAR അല്ലെങ്കിൽ Fiddler Everywhere SAZ; native mitmproxy-നായി Linux-ൽ mitmdump; [capture guide](../web-network-captures.md)           |
 | .NET assemblies        | Metadata, CIL instructions, പ്രഖ്യാപിച്ച native dependencies, build comparisons         | ഒന്നും ആവശ്യമില്ല (static മാത്രം); [managed-code guide](../managed-code-analysis.md)                                                    |
+| Python packaged apps   | CArchive/PYZ entries, Python version, bytecode, resources and runtime options       | Static PyInstaller parsing; [Python guide](../python-packaged-applications.md)                                                    |
 | Android APKs           | Manifest declarations, classes, decompiled methods, references                      | Linux/macOS/Windows x64-ൽ Headless JADX-ഉം full JDK-ഉം; [Android guide](../android-analysis.md)                                   |
 | Android devices        | Devices, packages, processes, logs, dumps, screen captures, APK/file transfers      | Caller നൽകുന്ന adb (emulator അല്ലെങ്കിൽ hardware); [ADB guide](../adb-device-analysis.md)                                             |
 | JEB projects           | Engine-backed project units, artifact digests, type/method pseudo-code              | MCP സേവനം നൽകുന്ന caller ആരംഭിച്ച JEB client; REA_JEB_MCP_URL ഉപയോഗിച്ച് തിരഞ്ഞെടുക്കുക; [JEB guide](../jeb-analysis.md)                   |
@@ -281,6 +286,8 @@ npx rea-agents@latest setup
 
 - [Installation and setup](../installation.md): agent registration, provider configuration, updates, uninstall.
 - [Readiness and troubleshooting](../installation.md#check-readiness-for-your-task): ഒരു agent-ന്റെയോ analysis engine-ന്റെയോ പ്രശ്നങ്ങൾ കണ്ടെത്തുക.
+- [CUDA / HIP](../gpu-code-objects.md)
+- [GGUF / safetensors](../model-artifacts.md)
 - [CLI and Evidence](../cli.md): commands, provider തിരഞ്ഞെടുക്കൽ, snapshots, import/export, exit statuses.
 - [MCP contracts](../mcp-contracts.md), [agent prompts](../mcp-prompts.md): tool results, sessions, guided investigations.
 - [Tool catalog](../mcp-contracts.md#generated-catalog): tools, providers, CLI commands എന്നിവയുടെ സ്വയമേവ സൃഷ്ടിച്ച പട്ടിക.

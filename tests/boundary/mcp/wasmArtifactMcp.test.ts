@@ -14,7 +14,8 @@ import { wasmArtifactSummaryViewResultSchema } from "../../../src/domain/analysi
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { createServer } from "../../../src/server/createServer.js";
-import { ok } from "../../../src/domain/result.js";
+import { err, ok } from "../../../src/domain/result.js";
+import { AnalysisInputError } from "../../../src/domain/analysisErrorCore.js";
 import { createApplicationMcpHarness } from "../../fixtures/applicationMcpHarness.js";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
@@ -164,10 +165,14 @@ it.each(["bin", "hop"])(
 
 it("advertises exact valid schemas and records inline WASM interface evidence without a binary target", async () => {
   const value = wasmArtifactFixture();
+  value.tool_profile.timeout_ms = 42_000;
   const close = vi.fn(() => Promise.resolve());
   const service = new WasmArtifactService({
     close,
-    inspect: () => Promise.resolve(ok(wasmArtifactExecution(value))),
+    inspect: (input) => {
+      expect(input.command_timeout_ms).toBe(42_000);
+      return Promise.resolve(ok(wasmArtifactExecution(value)));
+    },
   });
   const session = createTestBinarySession(() => {
     throw new Error("deep provider must not start");
@@ -184,6 +189,20 @@ it("advertises exact valid schemas and records inline WASM interface evidence wi
   );
   const { ajv, inputSchema } = schemas;
   expect(ajv.validate(inputSchema, { path: value.artifact.path })).toBe(true);
+  for (const command_timeout_ms of [1, 42_000, 2_147_483_647])
+    expect(
+      ajv.validate(inputSchema, {
+        path: value.artifact.path,
+        command_timeout_ms,
+      }),
+    ).toBe(true);
+  for (const command_timeout_ms of [0, -1, 1.5, 2_147_483_648, "1000", null])
+    expect(
+      ajv.validate(inputSchema, {
+        path: value.artifact.path,
+        command_timeout_ms,
+      }),
+    ).toBe(false);
   expect(
     ajv.validate(inputSchema, {
       path: value.artifact.path,
@@ -193,7 +212,7 @@ it("advertises exact valid schemas and records inline WASM interface evidence wi
   ).toBe(false);
   const response = await client.callTool({
     name: "inspect_wasm_artifact",
-    arguments: { path: value.artifact.path },
+    arguments: { path: value.artifact.path, command_timeout_ms: 42_000 },
   });
   assertRecordedMcpEvidence(
     response,
@@ -356,7 +375,8 @@ it("attributes rejected WASM paths to their selected fields before provider work
       paths.map((path) => ({
         path,
         reason: "invalid_format",
-        message: "Expected an absolute filesystem path on this host.",
+        expected: "regex",
+        message: "must be an absolute local filesystem path",
       })),
     );
   }
@@ -608,11 +628,14 @@ it("rejects absent or inconsistent WASM source identity before deriving portable
   await harness.client.ping();
 });
 
-it("requires retention for WASM summary delivery while keeping fixed-server complete delivery", async () => {
+it("rejects malformed paths, refuses WASM summary delivery before provider work when retention is unavailable, and keeps fixed-server complete delivery", async () => {
   const value = wasmArtifactFixture();
+  const inspect = vi.fn<WasmArtifactService["provider"]["inspect"]>(() =>
+    Promise.resolve(ok(wasmArtifactExecution(value))),
+  );
   const service = new WasmArtifactService({
     close: () => Promise.resolve(),
-    inspect: () => Promise.resolve(ok(wasmArtifactExecution(value))),
+    inspect,
   });
   const session = createTestBinarySession(() => {
     throw new Error("No deep provider");
@@ -626,9 +649,10 @@ it("requires retention for WASM summary delivery while keeping fixed-server comp
   try {
     await server.connect(b);
     await client.connect(a);
+    const summaryInput = { path: value.artifact.path, detail: "summary" };
     const summary = await client.callTool({
       name: "inspect_wasm_artifact",
-      arguments: { path: value.artifact.path, detail: "summary" },
+      arguments: summaryInput,
     });
     expect(parseMcpToolError(summary)).toMatchObject({
       error: {
@@ -636,14 +660,56 @@ it("requires retention for WASM summary delivery while keeping fixed-server comp
         message: expect.stringContaining("does not retain Evidence"),
       },
     });
-    const complete = await client.callTool({
+    expect(inspect).not.toHaveBeenCalled();
+    const malformed = await client.callTool({
       name: "inspect_wasm_artifact",
-      arguments: { path: value.artifact.path },
+      arguments: {
+        path: "relative.wasm",
+        glue_paths: ["relative.js"],
+        detail: "summary",
+      },
     });
-    expect(complete.isError).not.toBe(true);
-    expect(parseEvidence(complete.structuredContent).normalized_result).toEqual(
-      value,
+    const rejected = parseMcpToolError(malformed).error;
+    expect(rejected.code).toBe("invalid_request");
+    expect(
+      z.object({ issues: z.array(z.unknown()) }).parse(rejected.details).issues,
+    ).toEqual(
+      [["path"], ["glue_paths", 0]].map((path) => ({
+        path,
+        reason: "invalid_format",
+        expected: "regex",
+        message: "must be an absolute local filesystem path",
+      })),
     );
+    expect(inspect).not.toHaveBeenCalled();
+    for (const input of [
+      { path: value.artifact.path },
+      { path: value.artifact.path, detail: "complete" },
+    ]) {
+      const complete = await client.callTool({
+        name: "inspect_wasm_artifact",
+        arguments: input,
+      });
+      expect(complete.isError).not.toBe(true);
+      expect(
+        parseEvidence(complete.structuredContent).normalized_result,
+      ).toEqual(value);
+    }
+    expect(inspect).toHaveBeenCalledTimes(2);
+    inspect.mockImplementation(() =>
+      Promise.resolve(err(new AnalysisInputError("inspect_wasm_artifact"))),
+    );
+    const refused = await client.callTool({
+      name: "inspect_wasm_artifact",
+      arguments: summaryInput,
+    });
+    expect(parseMcpToolError(refused)).toMatchObject({
+      error: {
+        code: "capability_unavailable",
+        message: expect.stringContaining("Select detail complete"),
+      },
+    });
+    expect(inspect).toHaveBeenCalledTimes(2);
     await client.ping();
   } finally {
     await client.close();

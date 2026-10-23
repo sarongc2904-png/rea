@@ -20,12 +20,15 @@ import {
   type DomCapture,
   mainFrameUrl,
 } from "./CdpCaptureDocuments.js";
-import { capturedSvgNodeKind } from "./CdpCaptureDomSvg.js";
+import { capturedSvgNodeKind } from "./CdpCaptureDomNamespaces.js";
 import {
   allowedSanitizedUrl,
   delayWithCancellation,
 } from "./CdpCaptureValues.js";
-import { captureScripts } from "./CdpPageCaptureScripts.js";
+import {
+  captureScripts,
+  finalizeScriptInventory,
+} from "./CdpPageCaptureScripts.js";
 import { captureWorkers } from "./CdpPageCaptureWorkers.js";
 import type { WebSourceMapRequest } from "./WebSourceMapFetcher.js";
 
@@ -170,6 +173,8 @@ const captureAuthorizedPage = async (
     operation: context.operation,
   });
   const completedUrl = mainFrameUrl(completedFrameResult) ?? "";
+  if (state.events.unknownRootIdentity)
+    throw new BrowserObservationError("inspect_web_page", "protocol_error");
   if (state.events.originViolation)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   if (state.events.navigationDuringCapture || completedUrl !== attachedUrl)
@@ -178,6 +183,7 @@ const captureAuthorizedPage = async (
   // enabled through the final capture, so account for eligible responses that
   // arrived while those reads were pending.
   state.events.settleUnexaminedResponseBodies();
+  const scriptInventory = finalizeScriptInventory(scripts, state.events);
   state.events.recordScriptMetadataBudgetExclusions();
   return {
     inspection: normalizedInspection(state, {
@@ -185,7 +191,7 @@ const captureAuthorizedPage = async (
       frames,
       dom,
       accessibility,
-      scripts: scripts.inventory,
+      scripts: scriptInventory,
       resources,
       workers,
       storage: storageCapture.value,
@@ -264,6 +270,8 @@ const authorizeObservationWindow = async (
     context.operation,
     signal,
   );
+  if (events.unknownRootIdentity)
+    throw new BrowserObservationError("inspect_web_page", "protocol_error");
   if (events.originViolation)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
 };

@@ -12,10 +12,13 @@ import type {
 } from "../application/AnalysisProvider.js";
 import {
   createAnalysisExecution,
-  createAnalysisExecutionEvidence,
   type AnalysisExecution,
 } from "../application/AnalysisProvider.js";
-import type { FlutterRequest } from "../domain/flutter/flutterBuildAnalysis.js";
+import { createAnalysisExecutionEvidence } from "../domain/analysisObservation.js";
+import {
+  MAX_FLUTTER_LIBRARY_PATH_BYTES,
+  type FlutterRequest,
+} from "../domain/flutter/flutterBuildAnalysis.js";
 import {
   AnalysisAccessDeniedError,
   AnalysisArtifactChangedError,
@@ -26,6 +29,7 @@ import {
 } from "../domain/analysisErrorCore.js";
 import { AnalysisProtocolError } from "../domain/analysisErrorCore.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
+import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { err, ok, type Result } from "../domain/result.js";
@@ -53,6 +57,7 @@ import {
   readSnapshotHeader,
 } from "./DartElf.js";
 import { readElfBuildIds } from "./ElfBuildId.js";
+import { privateWorkspaceFailure } from "../process/privateWorkspaceFailure.js";
 
 /** Stable identity for the Flutter build-identification provider. */
 export const FLUTTER_PROVIDER_IDENTITY = {
@@ -71,7 +76,8 @@ const APK_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 // engine labels this keeps expanded result metadata below 512 KiB for ordinary
 // ABI names, independently of the archive's compressed-byte budget.
 const MAX_FLUTTER_ABIS = 32;
-const MAX_LIBRARY_PATH_BYTES = 1024;
+const flutterBudget = (allowance: string, kind: "parser" | "input") =>
+  fixedAllowanceOptions(allowance, kind);
 const MAX_POOL_URIS = 500;
 const MAX_POOL_TOKENS = 2_000;
 /** A complete AOT image carries exactly one VM and one isolate section. */
@@ -188,7 +194,10 @@ const mapInputFailure = (
       "memory",
       cause.message,
       { max_metadata_read_bytes: APK_METADATA_READ_MAX_BYTES },
-      { cause },
+      {
+        cause,
+        ...flutterBudget("The Flutter APK metadata read allowance", "parser"),
+      },
     );
   return new AnalysisInputError(operation, { cause }, [
     {
@@ -213,10 +222,15 @@ const inputFailureMessage = (path: string, cause: unknown): string => {
   return `The APK could not be read as a package: ${path}: ${message}`;
 };
 
-/** Provider-owned storage failures must never be attributed to caller input. */
+/**
+ * Provider-owned storage failures must never be attributed to caller input.
+ * `workspacePath` is the owned root once allocated, so a failure without its
+ * own errno path still names the workspace it occurred in.
+ */
 const mapOwnedIoFailure = (
   operation: string,
   cause: unknown,
+  workspacePath: string | null,
 ): AnalysisError => {
   if (cause instanceof AnalysisError) return cause;
   const cancellation = regularFileCancellation(cause);
@@ -231,24 +245,27 @@ const mapOwnedIoFailure = (
     "code" in cause &&
     typeof cause.code === "string"
   )
-    return new AnalysisResourceConstraintError(
+    return privateWorkspaceFailure(
+      FLUTTER_PROVIDER_IDENTITY.id,
       operation,
-      "file-size",
-      `Provider-owned Flutter snapshot storage failed (${cause.code}): ${cause.message}`,
-      null,
-      { cause },
+      cause,
+      workspacePath,
     );
   return new AnalysisProtocolError(operation, { cause });
 };
 
-/** ZIP format failures describe caller bytes; its descriptor is provider-owned. */
+/**
+ * ZIP format failures describe caller bytes. A system error comes from the
+ * provider-owned snapshot descriptor, so it propagates unchanged to the
+ * snapshot owner, which maps it against the owned workspace.
+ */
 const mapPackageFailure = (
   operation: string,
   path: string,
   cause: unknown,
-): AnalysisError =>
+): unknown =>
   cause instanceof Error && "code" in cause && typeof cause.code === "string"
-    ? mapOwnedIoFailure(operation, cause)
+    ? cause
     : mapInputFailure(operation, path, cause);
 
 interface FlutterLibrary {
@@ -284,7 +301,7 @@ const collectFlutterLibraries = async (
       abis.add(match[1]!);
       if (
         abis.size > MAX_FLUTTER_ABIS ||
-        Buffer.byteLength(entry.path) > MAX_LIBRARY_PATH_BYTES
+        Buffer.byteLength(entry.path) > MAX_FLUTTER_LIBRARY_PATH_BYTES
       )
         throw new AnalysisResourceConstraintError(
           operation,
@@ -292,8 +309,9 @@ const collectFlutterLibraries = async (
           "Flutter library inventory exceeds the bounded ABI projection budget",
           {
             max_flutter_abis: MAX_FLUTTER_ABIS,
-            max_library_path_bytes: MAX_LIBRARY_PATH_BYTES,
+            max_library_path_bytes: MAX_FLUTTER_LIBRARY_PATH_BYTES,
           },
+          flutterBudget("The Flutter ABI inventory allowance", "parser"),
         );
       libraries.push({
         entry,
@@ -329,6 +347,7 @@ const checkApkSize = (operation: string, bytes: number): void => {
       "file-size",
       `The selected APK exceeds the ${String(APK_MAX_BYTES)}-byte snapshot budget`,
       { max_apk_bytes: APK_MAX_BYTES, observed_bytes: bytes },
+      flutterBudget("the Flutter APK snapshot allowance", "input"),
     );
 };
 
@@ -372,7 +391,8 @@ export class FlutterBuildProvider {
     try {
       root = await mkdtemp(join(tmpdir(), "rea-flutter-"));
     } catch (cause) {
-      throw mapOwnedIoFailure(operation, cause);
+      // No workspace exists yet; the errno path names the attempted template.
+      throw mapOwnedIoFailure(operation, cause, null);
     }
     this.ownedRoots.set(root, new Set());
     const snapshotPath = join(root, "input.apk");
@@ -472,7 +492,7 @@ export class FlutterBuildProvider {
       await this.discardRoot(root);
       if (signal?.aborted === true)
         throw new AnalysisCancelledError(operation, { cause });
-      throw mapOwnedIoFailure(operation, cause);
+      throw mapOwnedIoFailure(operation, cause, root);
     }
   }
 
@@ -584,7 +604,11 @@ export class FlutterBuildProvider {
     options?: ExecutionOptions,
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
     if (options?.signal?.aborted === true)
-      return err(new AnalysisCancelledError(request.operation));
+      return err(
+        new AnalysisCancelledError(request.operation, {
+          cause: options.signal.reason,
+        }),
+      );
     const { path } = request.input;
     const signal = options?.signal;
     let snapshot: OwnedSnapshot | undefined;
@@ -616,7 +640,9 @@ export class FlutterBuildProvider {
               libraries,
             );
     } catch (cause) {
-      result = err(mapOwnedIoFailure(request.operation, cause));
+      result = err(
+        mapOwnedIoFailure(request.operation, cause, snapshot?.root ?? null),
+      );
     } finally {
       if (snapshot !== undefined) await this.discardRoot(snapshot.root);
     }
@@ -657,6 +683,7 @@ export class FlutterBuildProvider {
             "file-size",
             `${entry.path} exceeds the library read budget`,
             { max_library_bytes: LIBRARY_MAX_BYTES, entry_path: entry.path },
+            flutterBudget("the Flutter library read allowance", "input"),
           ),
         );
     }
@@ -677,6 +704,7 @@ export class FlutterBuildProvider {
             max_total_bytes: TOTAL_EXTRACTION_MAX_BYTES,
             declared_total: declaredTotal,
           },
+          flutterBudget("the Flutter cumulative extraction allowance", "input"),
         ),
       );
 
@@ -728,6 +756,7 @@ export class FlutterBuildProvider {
                 max_library_bytes: LIBRARY_MAX_BYTES,
                 entry_path: entry.path,
               },
+              flutterBudget("the Flutter library read allowance", "input"),
             ),
           );
         hash.update(view);
@@ -745,6 +774,10 @@ export class FlutterBuildProvider {
               "file-size",
               `cumulative library extraction across ${String(flutterEntries.length)} entries exceeds the ${String(TOTAL_EXTRACTION_MAX_BYTES)}-byte budget`,
               { max_total_bytes: TOTAL_EXTRACTION_MAX_BYTES },
+              flutterBudget(
+                "the Flutter cumulative extraction allowance",
+                "input",
+              ),
             ),
           );
       }
@@ -763,6 +796,10 @@ export class FlutterBuildProvider {
                 max_snapshot_hash_candidates: MAX_SNAPSHOT_HASH_CANDIDATES,
                 entry_path: entry.path,
               },
+              flutterBudget(
+                "The Flutter snapshot-hash candidate allowance",
+                "parser",
+              ),
             ),
           );
         facts.set(abi, {
@@ -963,6 +1000,7 @@ export class FlutterBuildProvider {
           "file-size",
           `lib/${selected.abi}/libapp.so declares ${String(declared)} bytes, exceeding the ${String(LIBRARY_MAX_BYTES)}-byte read budget`,
           { max_library_bytes: LIBRARY_MAX_BYTES },
+          flutterBudget("the Flutter library read allowance", "input"),
         ),
       );
     const imagePath = join(snapshot.root, "libapp.so");
@@ -992,6 +1030,7 @@ export class FlutterBuildProvider {
               "file-size",
               `lib/${selected.abi}/libapp.so exceeds the ${String(LIBRARY_MAX_BYTES)}-byte read budget while streaming`,
               { max_library_bytes: LIBRARY_MAX_BYTES },
+              flutterBudget("the Flutter library read allowance", "input"),
             ),
           );
         imageHash.update(view);

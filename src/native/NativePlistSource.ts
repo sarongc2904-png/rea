@@ -4,20 +4,24 @@ import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import type { FileHandle } from "node:fs/promises";
 import type { z } from "zod";
 import type { inspectPlistSchema } from "../domain/native/nativeInspection.js";
+import type { ResolvedAppBundleResourceRoot } from "../application/AppBundleExecutable.js";
 import type {
   AnalysisError,
   AnalysisErrorOptions,
   AnalysisCapturedOutput,
 } from "../domain/analysisErrorBase.js";
 import {
+  AnalysisArtifactChangedError,
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
   AnalysisInputError,
+  AnalysisResourceConstraintError,
 } from "../domain/analysisErrorCore.js";
 import { BinaryTargetError } from "../domain/configurationErrors.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import {
@@ -25,10 +29,15 @@ import {
   artifactFilePrimaryFailure,
   artifactFileCancellationCause,
   bindArtifactFileCleanup,
+  assertArtifactReadActive,
   withArtifactRegularFile,
 } from "../artifacts/ArtifactFileOperation.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { NATIVE_MACOS_PROVIDER_IDENTITY as IDENTITY } from "./NativeMacOSProviderMetadata.js";
+import {
+  MAX_NATIVE_PLIST_BYTES,
+  NATIVE_PLIST_INPUT_ALLOWANCE,
+} from "./parsers/plist.js";
 
 /** Resolved lookup identity and selection intent, independent of file readiness. */
 export interface NativePlistSelection {
@@ -66,6 +75,21 @@ export const resolveNativePlistSelection = async (
       new ProviderAdapterError(IDENTITY.id, "inspect_plist", { cause }),
     );
   }
+};
+
+/** Resolve a plist selection from the separately identified app resource root. */
+export const resolveBundleResourcePlistSelection = (
+  root: ResolvedAppBundleResourceRoot,
+  requested: string | undefined,
+): Result<NativePlistSelection, AnalysisError> => {
+  if (requested === undefined)
+    return ok({ path: root.infoPlistPath, origin: "default" });
+  return ok({
+    path: isAbsolute(requested)
+      ? resolve(requested)
+      : resolve(root.canonicalPath, requested),
+    origin: "selected",
+  });
 };
 
 /** The bundle whose Contents/MacOS directory directly holds the program. */
@@ -181,6 +205,39 @@ export const nativePlistFailure = (
       cause.message,
       { cause, capturedOutput },
     );
+  if (
+    selection !== undefined &&
+    cause instanceof ArtifactReaderFailure &&
+    cause.reason === "integrity"
+  )
+    return new AnalysisArtifactChangedError(
+      "inspect_plist",
+      selection.path,
+      cause.message,
+      { cause, capturedOutput },
+    );
+  if (cause instanceof ArtifactReaderFailure && cause.reason === "limit") {
+    const resource = cause.boundary ?? "memory";
+    return resource === "file-size"
+      ? new AnalysisResourceConstraintError(
+          "inspect_plist",
+          resource,
+          cause.message,
+          { maximum_input_bytes: MAX_NATIVE_PLIST_BYTES },
+          {
+            cause,
+            capturedOutput,
+            ...fixedAllowanceOptions(NATIVE_PLIST_INPUT_ALLOWANCE, "input"),
+          },
+        )
+      : new AnalysisResourceConstraintError(
+          "inspect_plist",
+          resource,
+          cause.message,
+          null,
+          { cause, capturedOutput, retryable: false },
+        );
+  }
   if (selection === undefined)
     return new ProviderAdapterError(IDENTITY.id, "inspect_plist", {
       cause,
@@ -203,6 +260,14 @@ export const nativePlistFailure = (
       cause,
       capturedOutput,
     });
+  if (code === "ELOOP" || code === "ENAMETOOLONG")
+    return unreadablePlist(
+      selection,
+      code === "ELOOP"
+        ? "symbolic-link traversal looped or exceeded the host limit (ELOOP)"
+        : "the path exceeds the host path or component length limit (ENAMETOOLONG)",
+      { cause, capturedOutput },
+    );
   if (code === "EACCES" || code === "EPERM")
     return new BinaryTargetError(
       path,
@@ -247,7 +312,55 @@ export const requireRegularPlist = (
 ): Promise<Result<null, AnalysisError>> =>
   readPlistFile(input, async () => null);
 
-/** Bytes examined for leading markup when `file` reports only text. */
+/** Read bounded source bytes through the same retained descriptor owner. */
+export const readNativePlistBytes = (
+  input: PlistFileInput,
+): Promise<Result<Buffer, AnalysisError>> =>
+  readPlistFile(input, async (file) => {
+    const before = await file.stat({ bigint: true });
+    if (before.size > BigInt(MAX_NATIVE_PLIST_BYTES))
+      throw new ArtifactReaderFailure(
+        "limit",
+        `Selected plist exceeds ${String(MAX_NATIVE_PLIST_BYTES)} bytes: ${input.selection.path}. This release has no runtime override for this ${String(MAX_NATIVE_PLIST_BYTES)}-byte allowance.`,
+        { boundary: "file-size" },
+      );
+    const bytes = Buffer.allocUnsafe(Number(before.size));
+    let position = 0;
+    while (position < bytes.length) {
+      assertArtifactReadActive(input.signal);
+      const length = Math.min(64 * 1024, bytes.length - position);
+      const { bytesRead } = await file.read(bytes, position, length, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+    }
+    const after = await file.stat({ bigint: true });
+    if (after.size > BigInt(MAX_NATIVE_PLIST_BYTES))
+      throw new ArtifactReaderFailure(
+        "limit",
+        `Selected plist grew beyond ${String(MAX_NATIVE_PLIST_BYTES)} bytes: ${input.selection.path}. This release has no runtime override for this ${String(MAX_NATIVE_PLIST_BYTES)}-byte allowance.`,
+        { boundary: "file-size" },
+      );
+    if (
+      !after.isFile() ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs ||
+      BigInt(position) !== before.size
+    )
+      throw new ArtifactReaderFailure(
+        "integrity",
+        `Selected plist changed during read: ${input.selection.path}`,
+      );
+    assertArtifactReadActive(input.signal);
+    return bytes;
+  });
+
+/**
+ * Bytes examined for leading markup when `file` reports only text.
+ * This is a probe window, not a document cap, and has no runtime override.
+ */
 const PLIST_MARKUP_PROBE_BYTES = 4096;
 
 /** Source classification remains independent of plutil's converted value format. */
@@ -257,7 +370,7 @@ export const plistSourceFormat = async (
 ): Promise<
   Result<z.infer<typeof inspectPlistSchema>["format"], AnalysisError>
 > => {
-  if (/binary property list/iu.test(description)) return ok("binary");
+  if (isBinaryPlistDescription(description)) return ok("binary");
   if (/\bXML\b/iu.test(description)) return ok("xml");
   if (/\bJSON\b/iu.test(description)) return ok("json");
   if (!/\btext\b/iu.test(description)) return ok("unknown");
@@ -280,3 +393,6 @@ export const plistSourceFormat = async (
       : "unknown";
   });
 };
+
+export const isBinaryPlistDescription = (description: string): boolean =>
+  /binary property list/iu.test(description);

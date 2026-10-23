@@ -29,12 +29,15 @@ interface ManagedPeFixtureOptions {
   readonly moduleRowCount?: number;
   readonly assemblyRowCount?: number;
   readonly memberRefParentRaw?: number;
+  readonly memberRefRowCount?: number;
   readonly memberRefName?: string;
   readonly memberRefSignature?: Buffer;
   /** Raw MethodDefOrRef coded values, one MethodSpec row each. */
   readonly methodSpecMethods?: readonly number[];
   /** Instantiation blob shared by every MethodSpec row. */
   readonly methodSpecInstantiation?: Buffer;
+  /** StandAloneSig LocalVarSig blobs, one row each. */
+  readonly standaloneSignatures?: readonly Buffer[];
   /** TypeSpec signature blobs, one TypeSpec row each. */
   readonly typeSpecSignatures?: readonly Buffer[];
   /** Raw ResolutionScope coded value of the TypeRef row; null by default. */
@@ -611,6 +614,7 @@ interface FixtureMetadataRowContext {
     readonly attributeBlob: number;
     readonly typeSpecSignatures: readonly number[];
     readonly methodSpecInstantiation: number;
+    readonly standaloneSignatures: readonly number[];
   };
   readonly heapSizes: {
     readonly strings: MetadataIndexSize;
@@ -734,6 +738,16 @@ const specTables = (
   heapSizes: FixtureMetadataRowContext["heapSizes"],
   widths: FixtureIndexWidths,
 ): readonly (readonly [number, readonly Buffer[]])[] => [
+  ...(indexes.standaloneSignatures.length === 0
+    ? []
+    : ([
+        [
+          17,
+          indexes.standaloneSignatures.map((signature) =>
+            metadataIndex(signature, heapSizes.blobs),
+          ),
+        ],
+      ] as const)),
   ...(indexes.typeSpecSignatures.length === 0
     ? []
     : ([
@@ -771,7 +785,7 @@ const fixtureIndexWidths = ({
     [4, 1],
     [6, options.methodRowCount ?? 1],
     [8, 0],
-    [10, 1],
+    [10, options.memberRefRowCount ?? 1],
     [
       12,
       options.targetFramework === null
@@ -781,6 +795,7 @@ const fixtureIndexWidths = ({
     ...(indexes.pinvokeModuleName === null ? [] : ([[26, 1]] as const)),
     ...(indexes.pinvokeImportName === null ? [] : ([[28, 1]] as const)),
     [27, indexes.typeSpecSignatures.length],
+    [17, indexes.standaloneSignatures.length],
     [32, options.assemblyRowCount ?? 1],
     [35, referenceStringIndexes.length],
     [39, indexes.exportedTypes.length],
@@ -885,7 +900,7 @@ const fixtureMetadataRows = ({
     ],
     [
       10,
-      [
+      repeatedRows(options.memberRefRowCount ?? 1, () =>
         memberRefRow({
           name: indexes.constructorName,
           signature: indexes.constructorSignature,
@@ -896,7 +911,7 @@ const fixtureMetadataRows = ({
             ? {}
             : { parentRaw: options.memberRefParentRaw }),
         }),
-      ],
+      ),
     ],
     [12, customAttributeRows({ options, indexes, heapSizes }, widths)],
     ...(indexes.pinvokeModuleName === null
@@ -1033,6 +1048,9 @@ const buildManagedFixtureMetadata = (
   const methodSignature = blobs.add(
     options.methodSignature ?? Buffer.from([0x00, 0x00, 0x01]),
   );
+  const standaloneSignatures = (options.standaloneSignatures ?? []).map(
+    (signature) => blobs.add(signature),
+  );
   const referenceBlobs = referenceBlobIndexes(blobs, options);
   const attributeBlob = blobs.add(
     fixedStringAttributeBlob(
@@ -1067,6 +1085,7 @@ const buildManagedFixtureMetadata = (
       tokenBlob,
       fieldSignature,
       methodSignature,
+      standaloneSignatures,
       attributeBlob,
       ...referenceBlobs,
     },

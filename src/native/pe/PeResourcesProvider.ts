@@ -1,7 +1,8 @@
+import { fixedNativeAllowance } from "../../domain/native/nativeDeadlines.js";
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
 import { readStableArtifact } from "../../artifacts/readStableArtifact.js";
 import {
-  ArtifactFileCleanupFailure,
+  artifactFilePrimaryFailure,
   bindArtifactFileCleanup,
   artifactFileCancellationCause,
 } from "../../artifacts/ArtifactFileOperation.js";
@@ -25,7 +26,10 @@ import {
 import { err, ok } from "../../domain/result.js";
 import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
 import { PE_RESOURCES_PROVIDER } from "../../application/InvestigationProviders.js";
-import { parsePeResources } from "./PeResourceParser.js";
+import {
+  parsePeResources,
+  PE_RESOURCE_METADATA_BYTES,
+} from "./PeResourceParser.js";
 
 /** Portable parser over one bounded, identity-checked regular file. */
 export class PeResourcesProvider implements PeResourcesPort {
@@ -76,7 +80,7 @@ export class PeResourcesProvider implements PeResourcesPort {
         );
       });
     } catch (cause) {
-      return err(peResourcesFailure(cause, input, options?.signal));
+      return err(peResourcesFailure(cause, input));
     }
   }
 }
@@ -92,10 +96,10 @@ export const inputBudgetRemediation = (
 ): string =>
   boundary === "file-size"
     ? input.max_file_bytes >= MAX_INSPECT_PE_FILE_BYTES
-      ? `The image exceeds the ${String(MAX_INSPECT_PE_FILE_BYTES)}-byte input ceiling this operation accepts; select a smaller artifact.`
+      ? `The image exceeds the ${String(MAX_INSPECT_PE_FILE_BYTES)}-byte input ceiling this operation accepts. This release has no runtime override. Select a smaller artifact.`
       : `Raise max_file_bytes above ${String(input.max_file_bytes)} bytes or select a smaller artifact; the limit is the caller-selected input read budget.`
     : input.max_entries >= MAX_INSPECT_PE_DIRECTORY_ENTRIES
-      ? `The image exceeds the ${String(MAX_INSPECT_PE_DIRECTORY_ENTRIES)}-entry resource-directory ceiling this operation accepts; select a smaller artifact.`
+      ? `The image exceeds the ${String(MAX_INSPECT_PE_DIRECTORY_ENTRIES)}-entry resource-directory ceiling this operation accepts. This release has no runtime override. Select a smaller artifact.`
       : `Raise max_entries above ${String(input.max_entries)} or select a smaller artifact; the limit is the caller-selected resource directory entry budget.`;
 
 const peResourcesFailurePrimary = (
@@ -118,7 +122,8 @@ const peResourcesFailurePrimary = (
   if (cause instanceof ArtifactReaderFailure) {
     // An input byte budget is a file-size bound, not a memory constraint, and
     // an entry budget is a capacity bound. Report what was actually exceeded.
-    if (cause.reason === "limit")
+    if (cause.reason === "limit") {
+      const metadata = cause.boundary === "memory";
       return new AnalysisResourceConstraintError(
         operation,
         cause.boundary ?? "memory",
@@ -126,22 +131,32 @@ const peResourcesFailurePrimary = (
         {
           max_file_bytes: input.max_file_bytes,
           max_entries: input.max_entries,
+          ...(metadata
+            ? { maximum_metadata_bytes: PE_RESOURCE_METADATA_BYTES }
+            : {}),
         },
         {
           cause,
-          // Both bounds are caller-selected and deterministic for the same
-          // input, so waiting for an active analysis cannot help.
-          ...(cause.boundary === undefined || cause.boundary === "memory"
+          // Caller-selected budgets and the fixed metadata allowance are
+          // deterministic for the same input, so waiting cannot help.
+          ...(cause.boundary === undefined
             ? {}
-            : {
-                retryable: false,
-                remediationAction: inputBudgetRemediation(
-                  cause.boundary,
-                  input,
-                ),
-              }),
+            : metadata
+              ? fixedNativeAllowance(
+                  "The PE resource metadata allowance",
+                  "parser",
+                  `${String(PE_RESOURCE_METADATA_BYTES)} bytes (8 MiB)`,
+                )
+              : {
+                  retryable: false as const,
+                  remediationAction: inputBudgetRemediation(
+                    cause.boundary,
+                    input,
+                  ),
+                }),
         },
       );
+    }
     if (cause.reason === "path" || cause.reason === "format")
       return new AnalysisInputError(operation, { cause }, [
         {
@@ -176,20 +191,11 @@ const peResourcesFailurePrimary = (
   );
 };
 
-const peResourcesFailure = (
-  cause: unknown,
-  input: InspectPeResourcesInput,
-  signal: AbortSignal | undefined,
-) => {
-  const primary =
-    cause instanceof ArtifactFileCleanupFailure &&
-    cause.fileCleanupFailure.outcome.kind === "failed"
-      ? peResourcesFailurePrimary(cause.fileCleanupFailure.outcome.cause, input)
-      : cause instanceof ArtifactFileCleanupFailure && signal?.aborted
-        ? new AnalysisCancelledError("inspect_pe_resources", {
-            cause: signal.reason,
-          })
-        : peResourcesFailurePrimary(cause, input);
+const peResourcesFailure = (cause: unknown, input: InspectPeResourcesInput) => {
+  const primary = peResourcesFailurePrimary(
+    artifactFilePrimaryFailure(cause),
+    input,
+  );
   if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
     return primary;
   const cleanup = new ProviderCleanupError(

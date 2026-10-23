@@ -8,7 +8,10 @@ import {
 } from "./HermesClientHome.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { resolveWindowsClaudeDesktopLocation } from "./ClaudeDesktopConfigLocation.js";
-import type { MsixPackageView } from "./MsixPackageStorage.js";
+import {
+  type MsixPackageView,
+  windowsAppDataRoots,
+} from "./MsixPackageStorage.js";
 
 /** One supported client configuration location. */
 export interface SetupClient {
@@ -117,11 +120,7 @@ const vscodeUserDirectory = ({
   env,
 }: ClientPathContext): string => {
   if (platform === "win32")
-    return join(
-      env.APPDATA ?? join(home, "AppData", "Roaming"),
-      "Code",
-      "User",
-    );
+    return join(windowsAppDataRoots(home, env).roaming, "Code", "User");
   if (platform === "darwin")
     return join(home, "Library", "Application Support", "Code", "User");
   return join(xdgConfigHome({ home, platform, env }), "Code", "User");
@@ -133,11 +132,7 @@ const traeUserDirectory = ({
   env,
 }: ClientPathContext): string => {
   if (platform === "win32")
-    return join(
-      env.APPDATA ?? join(home, "AppData", "Roaming"),
-      "Trae",
-      "User",
-    );
+    return join(windowsAppDataRoots(home, env).roaming, "Trae", "User");
   if (platform === "darwin")
     return join(home, "Library", "Application Support", "Trae", "User");
   return join(xdgConfigHome({ home, platform, env }), "Trae", "User");
@@ -288,9 +283,14 @@ export const registrationWriteBlocker = (
   const msix = client.msixPackage;
   if (msix === undefined || msix.processView === "direct") return undefined;
   const name = client.displayName ?? client.name;
-  return msix.processView === "redirected"
-    ? `This process was started from ${name}'s MSIX package ${msix.packageFamilyName}: its AppData is redirected into that package, so ${name} is running and would overwrite ${msix.privateConfigPath} from memory. Quit ${name} fully, then rerun ${operation} from a terminal that ${name} did not start.`
-    : `REA cannot tell whether ${name}'s MSIX package ${msix.packageFamilyName} started this process, because none of its files under ${dirname(msix.privateConfigPath)} could be compared with ${dirname(msix.appDataConfigPath)}. A running ${name} would overwrite the change. Open ${name} once if it has never run, quit it fully, then rerun ${operation} from a terminal that ${name} did not start.`;
+  if (msix.processView === "redirected")
+    return `This process was started from ${name}'s MSIX package ${msix.packageFamilyName}: its AppData is redirected into that package, so ${name} is running and would overwrite ${msix.privateConfigPath} from memory. Quit ${name} fully, then rerun ${operation} from a terminal that ${name} did not start.`;
+  // Setup would write the configuration the app reads; uninstall cleans both files.
+  const manualEdit =
+    operation === "setup"
+      ? `Add REA's entry to ${client.configPath} by hand`
+      : `Remove REA's entry by hand from each of ${msix.privateConfigPath} and ${msix.appDataConfigPath} that has one`;
+  return `REA cannot tell whether ${name}'s MSIX package ${msix.packageFamilyName} started this process, because no private file under ${dirname(dirname(msix.privateConfigPath))} could be compared with ${dirname(dirname(msix.appDataConfigPath))}, and a ${name} that started it would overwrite the change from memory. ${manualEdit} while ${name} is fully quit, or rerun ${operation} from a terminal that ${name} did not start once REA can compare a private file there.`;
 };
 
 /** The MSIX package view, if any, that redirects this process's AppData writes. */
@@ -365,7 +365,7 @@ const piAgentDirectory = ({
 };
 
 const copilotDirectory = ({ home, env }: ClientPathContext): string =>
-  env.COPILOT_HOME ?? join(home, ".copilot");
+  env.COPILOT_HOME || join(home, ".copilot");
 
 const commandCodeDirectory = ({ home }: ClientPathContext): string =>
   join(home, ".commandcode");
@@ -479,7 +479,7 @@ const geminiSettings = ({
 
 const devinDirectory = ({ home, platform, env }: ClientPathContext): string =>
   platform === "win32"
-    ? join(env.APPDATA ?? join(home, "AppData", "Roaming"), "devin")
+    ? join(windowsAppDataRoots(home, env).roaming, "devin")
     : join(env.XDG_CONFIG_HOME || join(home, ".config"), "devin");
 
 /** Stable product metadata used to derive setup discovery and documentation. */

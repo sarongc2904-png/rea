@@ -7,6 +7,7 @@ import {
 } from "../../fixtures/firmware/provider.js";
 import { firmwareResultSchemas } from "../../../src/domain/firmware/firmwareAnalysis.js";
 import { FirmwareAnalysisService } from "../../../src/application/firmware/FirmwareAnalysisService.js";
+import { FIRMWARE_LIMITS } from "../../../src/firmware/FirmwareRelease.js";
 import { FirmwareProvider } from "../../../src/firmware/FirmwareProvider.js";
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
 import { AnalysisError } from "../../../src/domain/analysisErrorBase.js";
@@ -98,6 +99,11 @@ it("binds region observations to exact bytes and preserves provider-reported unc
   const normalized = firmwareResultSchemas.inspect_firmware_regions.parse(
     result.value.normalized_result,
   );
+  expect(normalized.engine).toMatchObject({
+    name: "binwalk",
+    version: "3.1.0",
+    executable_path: fixture.commands.binwalk,
+  });
   expect(normalized.regions[0]).toMatchObject({
     offset: 2,
     reported_size: 4,
@@ -109,7 +115,11 @@ it("binds region observations to exact bytes and preserves provider-reported unc
     report: [{ Analysis: { file_map: [{ id: "hit" }] } }],
   });
   expect(fixture.launches[1]?.args).toEqual(
-    expect.arrayContaining(["--as=1073741824", "--threads", "1"]),
+    expect.arrayContaining([
+      `--as=${String(FIRMWARE_LIMITS.addressSpaceBytes)}:${String(FIRMWARE_LIMITS.addressSpaceBytes)}`,
+      "--threads",
+      "1",
+    ]),
   );
   await assertFirmwareCleanup(fixture.launches);
 });
@@ -140,6 +150,11 @@ it("extracts a selected interval with verified file identity and parent-byte lin
   const normalized = firmwareResultSchemas.extract_firmware.parse(
     result.value.normalized_result,
   );
+  expect(normalized.engine).toMatchObject({
+    name: "unblob",
+    version: "26.6.4",
+    executable_path: fixture.commands.unblob,
+  });
   expect(normalized.selection).toMatchObject({ offset: 2, length: 4 });
   expect(normalized.files[0]).toMatchObject({
     relative_path: "rootfs/config",
@@ -614,6 +629,12 @@ it.each(["depth", "dependency", "link"])(
           continuation: expect.stringContaining("installs nothing"),
         },
       ]);
+    const linkLimitation = expect.stringContaining(
+      "Unblob rewrites absolute targets relative to the extraction root",
+    );
+    if (mode === "link")
+      expect(result.value.limitations).toContainEqual(linkLimitation);
+    else expect(result.value.limitations).not.toContainEqual(linkLimitation);
     if (mode === "link") {
       expect(normalized.unpublished_entries).toEqual([
         {
@@ -730,7 +751,7 @@ it("retains startup stderr when Unblob exits 1 without a report", async () => {
       diagnostics: {
         exit_code: 1,
         stderr: expect.stringContaining("Landlock sandbox is not available"),
-        report_failure: expect.stringContaining("ENOENT"),
+        report_state: "missing",
       },
     },
   });
@@ -740,25 +761,51 @@ it("retains startup stderr when Unblob exits 1 without a report", async () => {
   await assertFirmwareCleanup(fixture.launches);
 });
 
-it("distinguishes a successful process with missing output from startup failure", async () => {
-  const fixture = await firmwareFixture("missing-report");
-  const result = await fixture.service.execute("extract_firmware", {
-    path: fixture.path,
-    output_directory: fixture.output,
-  });
-  expect(result).toMatchObject({
-    ok: false,
-    error: {
-      _tag: "AnalysisOutputError",
-      reason: expect.stringContaining("expected complete report"),
-    },
-  });
-  if (result.ok) throw new Error("Expected missing-output failure");
-  expect(projectAnalysisError(result.error)).toMatchObject({
-    details: { reason: expect.stringContaining("Producer forgot its report") },
-  });
-  await assertFirmwareCleanup(fixture.launches);
-});
+it.each([
+  { operation: "inspect_firmware_regions", engine: "binwalk" },
+  { operation: "extract_firmware", engine: "unblob" },
+] as const)(
+  "keeps $engine's missing report after exit 0 distinct from an empty result",
+  async ({ operation, engine }) => {
+    const fixture = await firmwareFixture("missing-report");
+    const result = await fixture.service.execute(operation, {
+      path: fixture.path,
+      ...(operation === "extract_firmware"
+        ? { output_directory: fixture.output }
+        : {}),
+    });
+    if (result.ok) throw new Error("Expected missing-report failure");
+    const error = {
+      code: "unreadable_output",
+      retryable: false,
+      message: expect.stringContaining("not an empty or complete result"),
+      details: {
+        reason: `${engine} exited 0 without a usable report: Report was not created`,
+        diagnostics: {
+          report_state: "missing",
+          report_path: expect.stringMatching(/report\.json$/),
+          command: expect.any(String),
+          args: expect.any(Array),
+          exit_code: 0,
+          signal: null,
+          stderr: "Producer forgot its report\n",
+        },
+      },
+      remediation: {
+        action: expect.stringContaining("did not retry or substitute"),
+      },
+    };
+    expect(projectAnalysisError(result.error)).toMatchObject(error);
+    expect(projectAnalysisError(result.error).message).not.toContain(
+      "rea doctor",
+    );
+    expect(
+      delivery.toCallToolResult(result, toolContract(operation))
+        .structuredContent,
+    ).toMatchObject({ error });
+    await assertFirmwareCleanup(fixture.launches);
+  },
+);
 
 it("cancels an owned active process and permits the next queued operation", async () => {
   const fixture = await firmwareFixture("stall");

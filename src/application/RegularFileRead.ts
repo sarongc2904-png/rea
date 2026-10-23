@@ -10,10 +10,13 @@ import {
 import {
   RegularFileCleanupFailure,
   RegularFileCancelled,
+  regularFileCancellation,
   withOwnedRegularFile,
+  OwnedRegularFileOperationFailure,
   type RegularFileOperationOutcome,
 } from "../filesystem/OwnedRegularFile.js";
 import { readBoundedFileBytes } from "../process/BoundedFileBytes.js";
+import type { AnalysisCleanupLease } from "../artifacts/AnalysisCleanupLease.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import type { AnalysisCleanupObservation } from "../domain/analysisErrorBase.js";
 
@@ -22,6 +25,20 @@ export interface RegularFileReadOptions {
   readonly signal?: AbortSignal | undefined;
   readonly symlinks?: "follow" | "reject";
   readonly resources?: ArtifactResourceScope;
+  /** Runs on the opened file's own state before any byte is read; throw to refuse the read. */
+  readonly admit?: (state: Stats) => void;
+  /** Tags cancellation at the bounded reader's cooperative checkpoints. */
+  readonly cancellationFailure?: (reason: unknown) => Error;
+}
+
+/** Preserves a physical descriptor-read cause until its owner has finalized. */
+export class RegularFileReadFailure extends OwnedRegularFileOperationFailure {
+  override readonly _tag = "RegularFileReadFailure";
+
+  constructor(operationCause: unknown) {
+    super(operationCause);
+    this.name = this._tag;
+  }
 }
 
 export class InvalidUtf8FileError extends TypeError {
@@ -35,21 +52,19 @@ export class InvalidUtf8FileError extends TypeError {
   }
 }
 
-export { RegularFileCleanupFailure } from "../filesystem/OwnedRegularFile.js";
-
-export type RegularFileReadOutcome<Value> = RegularFileOperationOutcome<Value>;
-
 /** Retry a failed close through its retained owner and report any remaining cleanup. */
 export const retryRegularFileCleanup = async <Value>(
   failure: RegularFileCleanupFailure<Value>,
   resources: ArtifactResourceScope,
   signal?: AbortSignal,
 ): Promise<{
-  readonly outcome: RegularFileReadOutcome<Value>;
+  readonly outcome: RegularFileOperationOutcome<Value>;
+  readonly cleanupLease?: AnalysisCleanupLease;
   readonly cleanup?: AnalysisCleanupObservation;
 }> => {
-  const outcome: RegularFileReadOutcome<Value> =
+  const outcome: RegularFileOperationOutcome<Value> =
     failure.outcome.kind === "failed" &&
+    failure.operationFailure === undefined &&
     failure.outcome.cause instanceof RegularFileOperationCancelled &&
     !(signal?.aborted === true && failure.outcome.cause === signal.reason)
       ? { kind: "failed", cause: failure.outcome.cause.reason }
@@ -62,6 +77,7 @@ export const retryRegularFileCleanup = async <Value>(
   if (released.kind === "released") return { outcome };
   return {
     outcome,
+    cleanupLease: released.lease,
     cleanup: {
       reason: `${failureMessage(failure.cleanupCause)}; retry: ${failureMessage(released.cause)}`,
       resources: [failure.path],
@@ -91,7 +107,10 @@ export const retryRegularFileCleanupFailures = async (
         ? retried.outcome.cause
         : current.cleanupCause;
     const nested =
-      current.outcome.kind === "failed" ? current.outcome.cause : undefined;
+      current.operationFailure === undefined &&
+      current.outcome.kind === "failed"
+        ? current.outcome.cause
+        : undefined;
     if (!(nested instanceof RegularFileCleanupFailure)) break;
     current = nested;
   }
@@ -151,21 +170,51 @@ export const withRegularFile = async <Value>(
       // Caller reasons are opaque, including objects shaped like file failures.
       // They do not transfer ownership of any descriptor to this operation.
       if (signal?.aborted === true && cause === signal.reason) throw cause;
-      if (cause instanceof RegularFileOperationCancelled) throw cause.reason;
+      if (cause instanceof RegularFileReadFailure) throw cause;
       if (
         cause instanceof RegularFileCancelled &&
-        cause.owner.handle === admitted
-      )
-        throw cause.reason;
-      if (
-        !(cause instanceof RegularFileCleanupFailure) ||
-        resources === undefined
+        cause.owner.handle !== admitted
       )
         throw cause;
-      const retry = await retryRegularFileCleanup(cause, resources, signal);
-      if (retry.cleanup !== undefined) throw cause;
-      if (retry.outcome.kind === "failed") throw retry.outcome.cause;
-      return retry.outcome.value;
+      if (cause instanceof RegularFileCleanupFailure) {
+        if (resources === undefined) throw cause;
+        const retry = await retryRegularFileCleanup(cause, resources, signal);
+        if (retry.cleanup !== undefined) throw cause;
+        if (retry.outcome.kind === "failed") {
+          if (
+            cause.operationFailure === undefined &&
+            signal?.aborted === true &&
+            retry.outcome.cause === signal.reason
+          )
+            throw signal.reason;
+          const cancellation =
+            cause.operationFailure === undefined
+              ? (regularFileCancellation(retry.outcome.cause) ??
+                regularFileCancellation(cause))
+              : undefined;
+          if (cancellation !== undefined) {
+            if (options.cancellationFailure !== undefined)
+              throw options.cancellationFailure(cancellation.reason);
+            throw cancellation.reason;
+          }
+          if (
+            cause.operationFailure !== undefined &&
+            options.cancellationFailure !== undefined
+          )
+            throw cause.operationFailure;
+          throw retry.outcome.cause;
+        }
+        return retry.outcome.value;
+      }
+      const cancellation = regularFileCancellation(cause);
+      if (cancellation !== undefined) {
+        if (options.cancellationFailure !== undefined)
+          throw options.cancellationFailure(cancellation.reason);
+        throw cancellation.reason;
+      }
+      if (options.cancellationFailure !== undefined)
+        throw new RegularFileReadFailure(cause);
+      throw cause;
     }
   };
   const value = await (resources === undefined
@@ -173,6 +222,8 @@ export const withRegularFile = async <Value>(
     : resources.run(operation));
   // A retained close may have recovered after the descriptor owner's outcome
   // was captured. Include that retry and the scope's finalization in cancellation.
+  if (signal?.aborted === true && options.cancellationFailure !== undefined)
+    throw options.cancellationFailure(signal.reason);
   signal?.throwIfAborted();
   return value;
 };
@@ -219,18 +270,36 @@ const readRegularFileContent = <Value>(
   path: string,
   decode: (bytes: Buffer, state: Stats) => Value,
   options: RegularFileReadOptions,
-): Promise<Value> =>
-  withRegularFile(
+): Promise<Value> => {
+  const operation = withRegularFile(
     path,
     async (handle, stats) => {
-      const bytes = await readBoundedFileBytes(
-        handle,
-        stats.size,
-        options.signal,
-      );
-      if (bytes === undefined || bytes.length !== stats.size)
-        throw new RegularFileChangedError(path);
-      return decode(bytes, stats);
+      try {
+        options.admit?.(stats);
+        const bytes = await readBoundedFileBytes(handle, stats.size, {
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+          cancellationFailure: (reason) =>
+            new RegularFileOperationCancelled(reason),
+          operationFailure: (cause) => new RegularFileReadFailure(cause),
+        });
+        if (bytes === undefined || bytes.length !== stats.size)
+          throw new RegularFileChangedError(path);
+        return decode(bytes, stats);
+      } catch (cause: unknown) {
+        if (
+          options.cancellationFailure !== undefined &&
+          !(cause instanceof RegularFileOperationCancelled) &&
+          !(cause instanceof RegularFileReadFailure)
+        )
+          throw new RegularFileReadFailure(cause);
+        throw cause;
+      }
     },
     options,
   );
+  if (options.cancellationFailure !== undefined) return operation;
+  return operation.catch((cause: unknown) => {
+    if (cause instanceof RegularFileReadFailure) throw cause.operationCause;
+    throw cause;
+  });
+};

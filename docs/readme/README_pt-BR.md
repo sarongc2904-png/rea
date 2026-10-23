@@ -1,7 +1,7 @@
 <div align="center">
 
 [English](../../README.md) · [简体中文](README_zh.md) · [繁體中文](README_zh-TW.md) · [日本語](README_ja.md) · [한국어](README_ko.md) · [Türkçe](README_tr.md) · [Русский](README_ru.md) · [Tiếng Việt](README_vi.md) · [ไทย](README_th.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [Français](README_fr.md) · [Українська](README_uk.md) · [Polski](README_pl.md) · **Português (Brasil)** · [العربية](README_ar.md) · [فارسی](README_fa.md) · [Bahasa Indonesia](README_id.md) · [Italiano](README_it.md)
-· [Ελληνικά](README_el.md) · [മലയാളം](README_ml.md)
+· [Ελληνικά](README_el.md) · [മലയാളം](README_ml.md) · [Roman Urdu](README_ur-Latn.md)
 
 # REA: Faça engenharia reversa de qualquer coisa
 
@@ -137,20 +137,25 @@ Seu agente chama o REA por MCP para inspecionar o alvo e rastrear o código rele
 
 ## O que você pode analisar
 
-O REA requer Node.js 22.x (>=22.19), 24.x (>=24.11) ou 26+, além do npm. As ferramentas adicionais e os sistemas anfitriões compatíveis dependem do alvo:
+O REA requer Node.js 22.x (>=22.23.4), 24.x (>=24.22.1) ou 26+ (>=26.12.1), além do npm. As ferramentas adicionais e os sistemas anfitriões compatíveis dependem do alvo:
 
 | Alvo                        | O que o REA retorna                                                                                                     | Requisitos e guia                                                                                                                 |
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Binários nativos            | Pseudocódigo, assembly, strings, símbolos, chamadas e referências                                                       | Hopper, Ghidra ou IDA; [análise nativa](../native-investigation.md)                                                               |
 | Estrutura ELF sem execução  | Seções, segmentos, símbolos/relocações originais e possíveis mecanismos de mitigação identificados por análise estática | pwntools fornecido pelo chamador no Linux x64; [diagnóstico de binários](../binary-diagnostics.md)                                |
+| PE certificates             | Authenticode WIN_CERTIFICATE entries and PKCS#7 signer/X.509 identity fields                                            | Built-in static PE inspection; [PE certificates](../pe-certificates.md)                                                           |
 | Bytecode EVM                | Seletores de despacho, offsets de bytes, argumentos inferidos e mutabilidade                                            | Entrada local com bytes brutos ou representação hexadecimal no Linux x64; [guia de EVM sem execução](../evm-bytecode.md)          |
 | Rust binaries               | Embedded cargo-auditable dependency list                                                                                | [Rust binaries](../rust-binaries.md)                                                                                              |
+| ELF notes                   | PT_NOTE/SHT_NOTE owners, types, GNU build-id and ABI-tag fields                                                         | Built-in static ELF inspection; [ELF notes](../elf-notes.md)                                                                      |
+| Erlang BEAM                 | IFF chunks, atoms, exports, and tables                                                                                  | Built-in static BEAM inspection; [Erlang BEAM](../erlang-beam.md)                                                                 |
 | Falhas do Linux registradas | Registros note brutos, registradores/sinais de cada thread registrada e candidatos opcionais a mapeamentos              | pwntools fornecido pelo chamador no Linux x64; GDB/pwndbg opcionais; [falhas registradas](../recorded-crashes.md)                 |
+| Instalações desktop         | Ambientes candidatos, arquivos de evidência, componentes e próximos passos                                              | Inspeção limitada de diretórios e cabeçalhos；[Aplicações desktop](../desktop-applications.md)                                    |
 | JavaScript / Electron       | Módulos, importações, source maps, rotas, IPC e relações com complementos nativos                                       | Node.js e npm; [análise de aplicativos](../javascript-application-workflows.md)                                                   |
 | Sites                       | Estrutura da página, scripts, observações de rede e capturas de tela solicitadas                                        | Um navegador da família Chrome; [análise do navegador](../browser-observation.md)                                                 |
 | Capturas de rede salvas     | Requisições, respostas, payloads acessíveis e localizações de origem                                                    | HAR; mitmdump no Linux para capturas no formato nativo do mitmproxy; [guia de capturas](../web-network-captures.md)               |
 | Capturas de pacotes         | Endpoints, DNS, TLS SNI, distribuição de protocolos e requisições HTTP                                                  | tshark e capinfos fornecidos pelo chamador; [guia pcap](../pcap-analysis.md)                                                      |
 | Assemblies .NET             | Metadados, instruções CIL, dependências nativas declaradas e comparações de builds                                      | Inspeção estática; [guia de código gerenciado](../managed-code-analysis.md)                                                       |
+| PyInstaller                 | CArchive, PYZ, Python bytecode                                                                                          | Static inspection; [Python packaged applications](../python-packaged-applications.md)                                             |
 | APKs Android                | Declarações do manifesto, classes, métodos descompilados e referências                                                  | JADX sem interface gráfica e um JDK completo no Linux/macOS/Windows x64; [guia de Android](../android-analysis.md)                |
 | Dispositivos Android        | Dispositivos, pacotes, processos, logs, despejos, capturas de tela e transferências de APK/arquivos                     | adb fornecido pelo chamador (emulador ou aparelho); [guia de ADB](../adb-device-analysis.md)                                      |
 | Projetos JEB                | Unidades de projeto do motor, hashes de artefatos e pseudocódigo de tipos/métodos                                       | Um cliente JEB iniciado pelo chamador servindo MCP, selecionado com REA_JEB_MCP_URL; [guia de JEB](../jeb-analysis.md)            |
@@ -263,6 +268,8 @@ Comece pelos [guias práticos](https://rea.tools/pt-BR/guides/) do site. Para op
 
 - [Instalação e configuração](../installation.md): registro de agentes, configuração de provedores, atualizações e desinstalação.
 - [Prontidão e solução de problemas](../installation.md#check-readiness-for-your-task): diagnóstico de um agente ou motor de análise específico.
+- [CUDA / HIP](../gpu-code-objects.md)
+- [GGUF / safetensors](../model-artifacts.md)
 - [CLI e Evidence](../cli.md): comandos, seleção de provedores, snapshots, importação/exportação e status de saída.
 - [Contratos MCP](../mcp-contracts.md) e [prompts para agentes](../mcp-prompts.md): resultados das ferramentas, sessões e investigações guiadas.
 - [Catálogo de ferramentas](../mcp-contracts.md#generated-catalog): inventário de ferramentas, provedores e comandos da CLI gerado durante o build.

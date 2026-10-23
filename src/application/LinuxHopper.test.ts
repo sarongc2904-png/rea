@@ -16,18 +16,19 @@ import {
   type LinuxHopperDownload,
   type LinuxHopperInstallHost,
   type LinuxHopperLauncherStatus,
-  type LinuxPackageFamily,
   type LinuxPackageInstallFailure,
   type LinuxPackageInstallOutcome,
 } from "./LinuxHopper.js";
 import { err, ok } from "../domain/result.js";
 import {
+  type LinuxPackageFamily,
   HopperReleaseError,
   type LinuxHopperRelease,
 } from "./HopperReleaseFeed.js";
 import type { VerifiedLinuxHopperPackage } from "./LinuxHopperPublisher.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import * as nativeCommands from "../process/ExecFileOutput.js";
+import * as pythonRuntime from "./LinuxHopperPython.js";
 import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
 
 describe("Linux package-manager command display", () => {
@@ -123,6 +124,7 @@ class RecordingLinuxHost implements LinuxHopperInstallHost {
   installPackage = (
     family: LinuxPackageFamily,
     archive: string,
+    _options?: { readonly signal?: AbortSignal },
   ): Promise<LinuxPackageInstallOutcome> => {
     if (!this.verifiedBeforeInstall)
       throw new Error("Package manager ran before publisher verification");
@@ -142,21 +144,35 @@ class RecordingLinuxHost implements LinuxHopperInstallHost {
   };
 }
 
+const TESTED_DISTRIBUTIONS = [
+  ['ID=ubuntu\nVERSION_ID="24.04"\n', "deb"],
+  ["ID=fedora\nVERSION_ID=41\n", "rpm"],
+  ['ID=nobara\nVERSION_ID="44"\nID_LIKE="rhel centos fedora"\n', "rpm"],
+  ["ID=arch\n", "arch"],
+  ["ID=cachyos\nID_LIKE=arch\n", "arch"],
+  ['ID=omarchy\nID_LIKE=arch\nVERSION_ID="4.0.4"\n', "arch"],
+] as const;
+
 describe("Linux Hopper host classification", () => {
-  it.each([
-    ['ID=ubuntu\nVERSION_ID="24.04"\n', "deb"],
-    ["ID=fedora\nVERSION_ID=41\n", "rpm"],
-    ['ID=nobara\nVERSION_ID="44"\nID_LIKE="rhel centos fedora"\n', "rpm"],
-    ["ID=arch\n", "arch"],
-    ["ID=cachyos\nID_LIKE=arch\n", "arch"],
-    ['ID=omarchy\nID_LIKE=arch\nVERSION_ID="4.0.4"\n', "arch"],
-  ] as const)(
+  it.each(TESTED_DISTRIBUTIONS)(
     "accepts an explicitly supported distribution",
     (document, family) => {
-      expect(parseLinuxDistribution(document)).toMatchObject({
+      expect(parseLinuxDistribution(document, "x64")).toMatchObject({
         packageFamily: family,
         hopperSetupSupported: true,
       });
+    },
+  );
+
+  it.each(TESTED_DISTRIBUTIONS)(
+    "keeps the x86_64-only Hopper package off an arm64 host running %s",
+    (document, family) => {
+      const distribution = parseLinuxDistribution(document, "arm64");
+      expect(distribution).toMatchObject({
+        packageFamily: family,
+        hopperSetupSupported: false,
+      });
+      expect(supportsReaHost(distribution)).toBe(true);
     },
   );
 
@@ -191,7 +207,9 @@ describe("Linux Hopper host classification", () => {
   ])(
     "rejects vendor/version combinations without a tested Hopper installer",
     (document) => {
-      expect(parseLinuxDistribution(document).hopperSetupSupported).toBe(false);
+      expect(parseLinuxDistribution(document, "x64").hopperSetupSupported).toBe(
+        false,
+      );
     },
   );
 
@@ -205,14 +223,16 @@ describe("Linux Hopper host classification", () => {
   ])(
     "hosts REA on a distribution Hopper has no tested package for: %s",
     (document) => {
-      const distribution = parseLinuxDistribution(document);
+      const distribution = parseLinuxDistribution(document, "x64");
       expect(distribution.hopperSetupSupported).toBe(false);
       expect(supportsReaHost(distribution)).toBe(true);
     },
   );
 
   it("withholds host support from a distribution with no package family", () => {
-    expect(supportsReaHost(parseLinuxDistribution("ID=nixos\n"))).toBe(false);
+    expect(supportsReaHost(parseLinuxDistribution("ID=nixos\n", "x64"))).toBe(
+      false,
+    );
     expect(supportsReaHost(undefined)).toBe(false);
   });
 });
@@ -260,6 +280,24 @@ describe("Linux Hopper installation", () => {
 });
 
 describe("Linux Hopper package installation", () => {
+  it("keeps runtime inspection failure distinct from package-manager failure and cleans the archive", async () => {
+    const host = new RecordingLinuxHost();
+    const failure = new pythonRuntime.LinuxHopperPythonError(
+      "configuration_unknown",
+      "Fixture unknown runtime",
+    );
+    host.installPackage = async () => ({
+      status: "runtime_unavailable",
+      failure,
+    });
+    expect(await installLinuxHopper(host)).toMatchObject({
+      status: "failed",
+      reason: "runtime_dependencies",
+      pythonRuntimeFailure: failure,
+    });
+    expect(host.cleaned).toEqual(["/tmp/rea test"]);
+  });
+
   it.each(["deb", "rpm", "arch"] as const)(
     "downloads, verifies, installs, reads back, and cleans a %s package",
     async (family) => {
@@ -341,11 +379,14 @@ describe("Linux Hopper cleanup and failure details", () => {
     const directory = await createTestTempDirectory("rea-hopper-status-");
     const launcher = join(directory, "Hopper");
     await writeFile(launcher, "fixture launcher");
-    const host = systemLinuxHopperInstallHost({
-      ...process.env,
-      HOME: directory,
-      XDG_CACHE_HOME: join(directory, "cache"),
-    });
+    const host = systemLinuxHopperInstallHost(
+      {
+        ...process.env,
+        HOME: directory,
+        XDG_CACHE_HOME: join(directory, "cache"),
+      },
+      async () => undefined,
+    );
     const command = vi
       .spyOn(nativeCommands, "execFileOutput")
       .mockResolvedValue({
@@ -426,9 +467,29 @@ describe("Linux Hopper cancellation", () => {
     ).toEqual({
       status: "failed",
       reason: "cancelled",
+      cancellationReason: controller.signal.reason,
     });
     expect(host.downloads).toEqual([]);
     expect(host.installed).toEqual([]);
+  });
+
+  it("forwards cancellation to package stages and retains its original cause through cleanup", async () => {
+    const host = new RecordingLinuxHost();
+    const controller = new AbortController();
+    const cause = new Error("caller cancelled between package transactions");
+    host.installPackage = async (_family, _archive, options) => {
+      expect(options?.signal).toBe(controller.signal);
+      expect(host.verifiedBeforeInstall).toBe(true);
+      controller.abort(cause);
+      return { status: "cancelled", cause };
+    };
+    const result = await installLinuxHopper(host, {
+      signal: controller.signal,
+    });
+    expect(result).toMatchObject({ status: "failed", reason: "cancelled" });
+    if (result.status === "failed")
+      expect(result.cancellationReason).toBe(cause);
+    expect(host.cleaned).toEqual(["/tmp/rea test"]);
   });
 });
 

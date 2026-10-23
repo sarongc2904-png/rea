@@ -33,6 +33,12 @@ encoded path separators, ASAR directories or links, and nonexistent paths are
 rejected. The endpoint exposes every eligible target and its local path
 metadata.
 
+Cancellation stops further file authorization after an already-started filesystem
+operation settles. ASAR descriptor-close failures remain typed incomplete cleanup
+with an exact retryable owner; they are not treated as a missing or unauthorized
+page. A later authorization and provider shutdown retry retained descriptors
+before reporting their release.
+
 ## Workflow
 
 `list_electron_targets` returns every eligible target served by the supplied endpoint in one inline array.
@@ -64,11 +70,19 @@ DOM node indices retain their snapshot positions. Invalid rows are omitted with
 completeness diagnostics, so `total_nodes` can exceed the retained node count
 and a parent index can refer to an omitted source node.
 
-Script metadata retains its execution-context frame ID when CDP supplies one. The capture also
+Script metadata retains its execution-context frame ID when CDP supplies one and
+the observed frame generation is authorized. Frames describe the current inventory;
+script observations can retain earlier authorized frames that have since detached.
+The capture also
 inventories worker, service-worker, and shared-worker targets with
 validated opener-target and parent-frame IDs. Worker discovery uses passive
 target metadata; REA does not attach to or execute code in those targets.
-Collection counts and aggregate script-source bytes are not capped. Like every
+Script-source collection retains at most 32 MiB of UTF-8 text across scripts
+and shares a 20-second collection deadline. Omitted sources retain their script
+metadata and an explicit reason; later smaller sources may still fit after an
+oversized source is omitted. The separate 64 MiB CDP response limit bounds one
+wire message before retention admission, rather than total transient memory.
+The source budget adds no script-count cap. Like every
 target, frame, script, and resource, a worker URL must resolve to a local
 file before it is retained. Relationship IDs improve
 attribution but do not prove which static module started a worker or that its
@@ -105,7 +119,9 @@ The CLI and MCP surfaces accept the same schema. For a JSON request file:
 rea capture-electron-scenario scenario.json --json
 ```
 
-The result records action status and targets, correlated app/window/WebContents,
+The result records one status and target per declared action; actions after a
+failed or cancelled action are not run and are recorded as `cancelled` with a
+not-executed error. It also records correlated app/window/WebContents,
 preload, session, navigation, shell, permission, popup, download, protocol,
 native-addon, process, and IPC timeline events. IPC channels and argument-shape
 metadata retain their observed lengths; payload values are never retained.
@@ -193,8 +209,25 @@ Caller-defined `.listener` properties can change the identity exposed by
 wrapper recognition. Re-registering a raw recording wrapper on another channel
 retains the original registration's channel attribution.
 Mutating `.listener` on a raw recording wrapper can also prevent removal through
-application decorators; the reproduced identity conflict is tracked in
-[#4513](https://github.com/morluto/rea/issues/4513).
+application decorators that bypass the hook's removal methods. When a removal
+request reaches the hook's methods and its registration order is known, private
+callback ownership preserves removal by the original function and the newest
+matching registration when public metadata is changed or deleted. Native removal
+still determines getter execution, exceptions and removal meta-events.
+
+If registration or removal methods differ from the Node methods captured at hook
+initialization, the hook leaves listener callbacks unwrapped and records a
+`listener-registration` observation gap. The application keeps its original
+callback and receiver; callback execution remains unobserved. This comparison
+assumes Node's EventEmitter prototype has not itself been globally decorated
+before hook initialization. The provider loads the hook before the application
+and excludes `NODE_OPTIONS` from the child environment.
+
+An opaque later listener or unsupported emitter state can prevent proof of
+removal order. The hook then delegates removal
+to the native method and records a `listener-removal` gap rather than claiming
+which registration was removed. These gaps are distinct from dropped records
+and do not establish IPC delivery or successful removal.
 
 ### Target fuse prerequisites
 
@@ -215,4 +248,10 @@ application path and capture outcome to the static graph, while frames, scripts,
 workers, and execution claims remain unavailable until a separate passive runtime
 capture provides them.
 
-ASAR observation reads the header through one open file handle, validates its declared lengths against the archive size, and limits encoded JSON headers to 16 MiB before parsing. The header cache also retains at most 16 MiB of encoded headers across eight archives. Oversized headers produce a scope refusal.
+ASAR observation reads the header through one open file handle and validates its
+declared lengths against the archive size. Header/index admission is the same
+budget used by static ASAR reads: 16 MiB / 16777216 bytes by default, or
+`REA_ASAR_MAX_HEADER_BYTES` (at most 256 MiB) when set. An oversized header is
+not parsed; selecting a member path does not bypass admission, and the page
+stays unauthorized. The header cache separately retains at most that many bytes
+of already-admitted encoded headers across eight archives. Evicting that cache does not raise admission.

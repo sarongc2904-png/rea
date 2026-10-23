@@ -12,10 +12,8 @@ import {
   NonRegularFileReadError,
   RegularFileChangedError,
 } from "../filesystem/RegularFile.js";
-import {
-  RegularFileCleanupFailure,
-  withRegularFile,
-} from "./RegularFileRead.js";
+import { RegularFileCleanupFailure } from "../filesystem/OwnedRegularFile.js";
+import { withRegularFile } from "./RegularFileRead.js";
 import { clientSkillDirectories } from "./SupportedClients.js";
 import { preserveCurrentRecoveryBackup } from "./SetupRecoveryBackup.js";
 
@@ -53,12 +51,9 @@ const readSkillFileState = async (
   withRegularFile(
     path,
     async (handle, stats) => {
-      const bytes = await readBoundedFileBytes(
-        handle,
-        stats.size,
-        undefined,
-        stats.size,
-      );
+      const bytes = await readBoundedFileBytes(handle, stats.size, {
+        expectedSize: stats.size,
+      });
       if (bytes === undefined || bytes.length !== stats.size)
         throw new RegularFileChangedError(path);
       return { bytes, mode: stats.mode & 0o7777 };

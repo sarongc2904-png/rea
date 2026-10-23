@@ -65,6 +65,7 @@ rea decode-android-resources /targets/Example.apk --locale de
 rea decode-android-resources /targets/Example.apk --locales de --locales pt-BR
 rea decode-android-resources /targets/Example.apk --locales de --locales pt-BR --string-tables-only
 rea decode-android-resources /targets/Example.apk --no-strings
+rea decode-android-resources /targets/Example.apk --decode-timeout-ms 900000
 ```
 
 Equivalent MCP methods are `inspect_apktool_client` and
@@ -72,8 +73,10 @@ Equivalent MCP methods are `inspect_apktool_client` and
 primary `locale` (project `res/values-<locale>/strings.xml` instead of the default
 table), `locales` (repeatable array of additional localized string tables to project
 from the same single decode pass), and `include_strings` (default true). Regional locales such as `pt-BR`
-select Android's `values-pt-rBR`; Android qualifiers such as `pt-rBR` and
-`b+zh+Hans+CN` may also be supplied directly.
+select Android's `values-pt-rBR`. A three-digit region such as `es-419`
+selects `values-b+es+419`; `es-r419` is rejected because Android's legacy
+`-r` form requires a two-letter region. Android qualifiers such as `pt-rBR`
+and `b+zh+Hans+CN` may also be supplied directly.
 
 Set `string_tables_only: true` (CLI `--string-tables-only`) to return string
 entries only inside `string_tables`, including when selecting a single table.
@@ -131,9 +134,14 @@ still suppresses all string projection, including in this mode.
 
 ## Resource and lifecycle limits
 
-- The decode runs with a 600 s deadline and a 4 MiB output capture budget;
-  a stopped decode reports `provider_timeout` and exceeded budgets report
-  `resource_constraint`.
+- The decode wall clock is `decode_timeout_ms` (CLI `--decode-timeout-ms`).
+  Omitted means 600000 ms. The integer range is 1 to 2147483647. A change
+  applies on the next decode. It does not raise the 4194304-byte (4 MiB)
+  output capture budget. That capture budget has no runtime override. A
+  stopped decode reports `provider_timeout` and names the effective
+  milliseconds; an exceeded capture budget reports `resource_constraint`.
+- The version probe waits 20000 ms and retains 65536 bytes. This release has
+  no runtime override for that probe. `decode_timeout_ms` does not raise it.
 - Manifest reads are bounded to 512 KiB before decoding UTF-8. Strings XML
   reads are bounded to 8 MiB; larger documents are skipped with partial
   coverage and an explicit limit, rather than reported as missing.
@@ -159,6 +167,6 @@ Multi-locale and table-only projection were also verified through real CLI and
 stdio MCP workflows on Linux with Apktool 3.0.3/JDK 21 against NewPipe 0.29.1,
 ApiDemos 6.0.18 and Appium Settings 8.2.1. Independent XML projection checks,
 exact facts/Evidence parity and bounded task costs are recorded in the
-[shared-decode and table-only checkpoint](../experiments/analysis-efficiency/apktool-string-tables.md).
+[shared-decode and table-only checkpoint](https://github.com/morluto/rea/blob/42e1a17d6e6c0487f17be0bae248553c4caba7f7/experiments/analysis-efficiency/apktool-string-tables.md).
 This qualifies selected resource facts, not application execution or independent
 binary resource-decoder completeness.

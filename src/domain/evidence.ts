@@ -24,6 +24,8 @@ import {
 } from "./jsonValue.js";
 import {
   freezeJsonSnapshot,
+  freezeOwnedJsonTreeSnapshot,
+  canBorrowParsedJsonSnapshot,
   isImmutableJsonSnapshot,
 } from "./immutableJson.js";
 import { digestSchema } from "./../domain/digests.js";
@@ -57,6 +59,7 @@ const subjectFormatSchema = z.enum([
   "hsp",
   "app-pack",
   "asar",
+  "godot-pck",
   "dmg",
   "pkg",
   "plist",
@@ -68,6 +71,7 @@ const subjectFormatSchema = z.enum([
   "mach-o-universal",
   "javascript-bundle",
   "entitlements",
+  "pyinstaller",
 ]);
 const subjectBaseSchema = z.strictObject({
   name: z.string().min(1),
@@ -100,16 +104,17 @@ export const evidenceLocationSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("artifact-path"), path: z.string().min(1) }),
   z.strictObject({
     kind: z.literal("file-offset"),
-    offset: z.number().int().min(0),
+    offset: z.int().min(0),
   }),
   z.strictObject({
     kind: z.literal("file-offset-range"),
-    start: z.number().int().min(0),
-    end: z.number().int().min(0),
+    start: z.int().min(0),
+    end: z.int().min(0),
   }),
 ]);
 
-const evidenceAuthoritySchema = z.enum([
+/** Source authority vocabulary owned by Evidence and reused by its consumers. */
+export const evidenceAuthoritySchema = z.enum([
   "shipped-artifact",
   "controlled-replay",
   "historical-reference",
@@ -222,11 +227,7 @@ export const rebindEvidenceSubjectTargetPath = (
 type EvidenceAuthority = z.infer<typeof evidenceAuthoritySchema>;
 type ExecutionEnvironment = z.infer<typeof executionEnvironmentSchema>;
 
-export interface EvidenceProvider {
-  readonly id: string;
-  readonly name: string;
-  readonly version: string | null;
-}
+export type EvidenceProvider = Readonly<z.output<typeof providerSchema>>;
 
 export interface EvidenceObservation {
   readonly predicateType?: string;
@@ -288,8 +289,12 @@ export const parseEvidence = (input: unknown): Evidence => {
 };
 
 /** Authenticate and seal a ledger-owned snapshot; external mutable values are copied first. */
-export const immutableEvidence = (input: unknown): Evidence =>
-  rememberImmutableEvidence(parseEvidence(input));
+export const immutableEvidence = (input: unknown): Evidence => {
+  const parsed = parseEvidence(input);
+  return rememberImmutableEvidence(
+    canBorrowParsedJsonSnapshot(input, parsed) ? input : parsed,
+  );
+};
 
 /** Rebind display path metadata when an authenticated record names this target. */
 export const rebindEvidenceToTargetPath = (
@@ -338,11 +343,17 @@ const rememberImmutableEvidence = (evidence: Evidence): Evidence => {
   return evidence;
 };
 
+/** Ownership policy for the freshly parsed Evidence snapshot. */
+export interface EvidenceCreationOptions {
+  readonly immutable?: boolean;
+}
+
 /** Build deterministic Evidence from an immutable artifact subject. */
 export const createEvidence = (
   target: EvidenceSubjectTarget | BinaryTarget | undefined,
   provider: EvidenceProvider,
   observation: EvidenceObservation,
+  options?: EvidenceCreationOptions,
 ): Evidence => {
   const { normalized, sharedResult } = normalizeEvidenceObservation(
     target,
@@ -353,7 +364,15 @@ export const createEvidence = (
     ...normalized,
     evidence_id: computeEvidenceId(normalized),
   };
-  return sharedResult ? rememberImmutableEvidence(evidence) : evidence;
+  // Seal this already parsed, exclusively owned snapshot without authenticating
+  // or copying its payload again, including later partial-error delivery.
+  if (sharedResult || options?.immutable === true) {
+    // The normalizer's JSON parser clones mutable payloads into trees and only
+    // borrows previously sealed roots. No graph-sized sealing scratch is needed.
+    freezeOwnedJsonTreeSnapshot(evidence);
+    immutableEvidenceSnapshots.set(evidence, evidence);
+  }
+  return evidence;
 };
 
 /** Create Evidence from owned immutable JSON while exposing cooperative computation steps. */

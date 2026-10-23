@@ -1,6 +1,6 @@
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
-import type { FileCloseResourceOwner } from "../application/AnalysisProvider.js";
+import type { RetainedResourceScope } from "../application/AnalysisProvider.js";
 import {
   probeGhidraJava,
   type GhidraJavaObservation,
@@ -22,6 +22,7 @@ import { delimiter as pathDelimiter, dirname, posix, win32 } from "node:path";
 import type { ProviderRejectionCode } from "../contracts/providerSelection.js";
 import {
   parseExecutableHeader,
+  readFatArchitectureFamilies,
   type ExecutableMetadata,
 } from "../domain/binaryTarget.js";
 import {
@@ -111,39 +112,37 @@ const assessNativeDecompiler = (
       status: "unknown",
       detail: `${path} is executable, but no native tool format is defined for ${platform}/${architecture}`,
     };
-  let parsed =
+  const parsed =
     probe === undefined
       ? undefined
       : parseExecutableHeader(probe.bytes, architecture, probe.size);
-  if (probe !== undefined && parsed !== undefined && !parsed.ok) {
-    // FAT parsing selects a host slice. A validated foreign slice can still
-    // prove that its complete architecture table excludes this host. If the
-    // host is listed but its slice is malformed, preserve the unknown outcome.
-    for (const { node } of NATIVE_ARCHITECTURES) {
-      if (node === architecture) continue;
-      const alternative = parseExecutableHeader(probe.bytes, node, probe.size);
-      if (
-        alternative.ok &&
-        !alternative.value.availableArchitectures.some(
-          (available) => available === expectedArchitecture,
-        )
-      ) {
-        parsed = alternative;
-        break;
-      }
-    }
-  }
-  if (parsed === undefined || !parsed.ok)
+  // Slice selection can refuse a FAT table that still proves this host is
+  // excluded, such as one declaring only arm64 and arm64e; its validated
+  // families decide. A malformed host slice remains an unknown outcome.
+  const families =
+    probe !== undefined && parsed !== undefined && !parsed.ok
+      ? readFatArchitectureFamilies(probe.bytes, probe.size)
+      : null;
+  const header = parsed?.ok
+    ? parsed.value
+    : families?.ok &&
+        !families.value.some((family) => family === expectedArchitecture)
+      ? {
+          format: "mach-o-universal" as const,
+          architecture: families.value.join("/") || "no supported architecture",
+        }
+      : undefined;
+  if (header === undefined)
     return {
       status: "unknown",
       detail: `${path} is executable, but its executable format for ${platform}/${architecture} could not be established`,
     };
-  const observed = `${parsed.value.format} ${parsed.value.architecture}`;
+  const observed = `${header.format} ${header.architecture}`;
   const expected = `${expectedFormat} ${expectedArchitecture}`;
   const formatMatches = isMachOFormat(expectedFormat)
-    ? isMachOFormat(parsed.value.format)
-    : parsed.value.format === expectedFormat;
-  if (formatMatches && parsed.value.architecture === expectedArchitecture)
+    ? isMachOFormat(header.format)
+    : header.format === expectedFormat;
+  if (formatMatches && header.architecture === expectedArchitecture)
     return {
       status: "compatible",
       detail: `${path} reports ${observed}, which matches ${platform}/${architecture}`,
@@ -160,7 +159,7 @@ const assessNativeDecompiler = (
 /** Caller-owned paths and host coordinates used for one installation probe. */
 export interface GhidraInstallationOptions {
   readonly environment: Readonly<NodeJS.ProcessEnv>;
-  readonly resourceOwner: FileCloseResourceOwner;
+  readonly resourceOwner: RetainedResourceScope;
   readonly signal?: AbortSignal;
   readonly installDir?: string;
   readonly javaHome?: string;
@@ -530,9 +529,12 @@ const installationCoordinates = async (
         .find((candidate) => host.executable(candidate)) ?? "java"
     );
   })();
-  // Relative JAVA_HOME is refused by configuration validation without execution.
+  // Java is a prerequisite of a selected installation. Without one, or with a
+  // relative JAVA_HOME, configuration validation refuses Ghidra before Java can
+  // matter, so callers such as setup and doctor must not execute a host JVM.
   const javaProbe =
-    options.javaHome === undefined || path.isAbsolute(options.javaHome)
+    installDir !== null &&
+    (options.javaHome === undefined || path.isAbsolute(options.javaHome))
       ? await host.probeJava(
           javaCommand,
           ghidraJavaEnvironment(
@@ -1034,13 +1036,49 @@ export const discoverGhidraInstallationOnPath = (
       );
       try {
         if (statSync(properties).isFile() && executablePath(headless))
-          return root;
+          return stableGhidraInstallationRoot(root, platform);
       } catch (cause: unknown) {
         void cause;
       }
     }
   }
   return undefined;
+};
+
+/**
+ * Keep a Homebrew Ghidra registration stable across keg upgrades when its
+ * `opt` alias resolves to this exact, already validated installation.
+ */
+const stableGhidraInstallationRoot = (
+  root: string,
+  platform: NodeJS.Platform,
+): string => {
+  if (platform !== "darwin") return root;
+  const parsed = posix.parse(root);
+  const segments = root.slice(parsed.root.length).split(posix.sep);
+  const cellarIndex = segments.length - 4;
+  const formula = segments[cellarIndex + 1];
+  const version = segments[cellarIndex + 2];
+  if (
+    cellarIndex < 0 ||
+    segments[cellarIndex] !== "Cellar" ||
+    formula === undefined ||
+    formula.length === 0 ||
+    version === undefined ||
+    version.length === 0 ||
+    segments[cellarIndex + 3] !== "libexec"
+  )
+    return root;
+
+  const prefix = posix.join(parsed.root, ...segments.slice(0, cellarIndex));
+  const candidate = posix.join(prefix, "opt", formula, "libexec");
+  try {
+    return realpathSync(candidate) === root ? candidate : root;
+  } catch (cause: unknown) {
+    // An absent or unresolved alias cannot establish a stable installation identity.
+    void cause;
+    return root;
+  }
 };
 
 const executablePath = (path: string): boolean => {

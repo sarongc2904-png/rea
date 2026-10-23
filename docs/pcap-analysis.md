@@ -17,7 +17,16 @@ rea inspect-pcap-capture /captures/session.pcapng --json
 ```
 
 Without explicit tool commands, this family resolves them through PATH and
-records that selection source. Client inspection reads no capture file. Capture
+records that selection source. On Linux and macOS it runs the tool found in the
+first absolute PATH entry holding an executable file, the same selection the
+[packet capture tools](packet-captures.md) make; relative PATH entries are
+skipped. Windows keeps PATH/PATHEXT resolution in the process launcher. Client
+inspection reads no capture file; on hosts where PATH/PATHEXT does not expose
+an absolute candidate, its executable digest and resolved path are reported as
+unresolved. Otherwise the canonical executable path and SHA-256 are reported.
+The pcap provider and packet tools share the selected-tool identity check, and
+changes to a resolved executable during a run fail with artifact-changed
+Evidence. Capture
 inspection requires Linux with util-linux prlimit or Windows with owned Job
 Objects. macOS capture inspection returns a capability gap because the new
 native memory boundary is unverified; its version probes remain available.
@@ -67,12 +76,19 @@ Addresses count once per packet, including loopback and nested IP occurrences.
 DNS addresses are associated only with one question in the same response packet;
 additional records may be included, so this does not prove final resolution.
 Ambiguous addresses remain in a separate inventory. Protocol distribution counts
-exact `frame.protocols` stack strings. TLS SNI is recorded handshake metadata,
+exact nonempty `frame.protocols` stack strings. Frames for which TShark reports
+an empty stack, including zero-length packets, still contribute to the packet
+count without adding a protocol row. An all-empty stack inventory can have
+complete examined coverage; it does not establish the absence of network traffic.
+TLS SNI is recorded handshake metadata,
 not process identity or proof of the destination's authenticity.
 
 All examined inventories are retained within the resource budget; no fixed
 200/100/50-item truncation is applied. HTTP transport credentials are excluded
 without rewriting other URI bytes; ambiguous credential spans cause omission.
+The URI inventory includes absolute-form HTTP request targets when TShark cannot
+construct `http.request.full_uri` because no Host header was reported; relative
+request targets are not promoted to absolute URIs.
 Counts preserve distinct observed source URIs before omission or coalescing.
 `coverage: "partial"` records unresolved DNS attribution or URI item loss;
 component credential exclusion is also counted explicitly. Diagnostics retain

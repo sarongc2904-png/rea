@@ -12,11 +12,10 @@ import {
   type BrowserTargetList,
   type WebPageInspection,
 } from "../domain/browserObservationSchemas.js";
-import { analyzeCapturedWebBundle } from "../domain/webBundleAnalyzer.js";
-import {
-  webBundleAnalysisSchema,
-  type AnalyzeWebBundleInput,
-  type WebBundleAnalysis,
+import { IsolatedWebBundleAnalyzer } from "./IsolatedWebBundleAnalyzer.js";
+import type {
+  AnalyzeWebBundleInput,
+  WebBundleAnalysis,
 } from "../domain/webBundleAnalysis.js";
 import {
   webObservationSessionSchema,
@@ -69,6 +68,7 @@ import {
   type CdpTargetSession,
 } from "./CdpTargetSession.js";
 import { capturePage, type CapturedPage } from "./CdpPageCapture.js";
+import { selectedCdpCommandTimeoutMs } from "../domain/browserDeadline.js";
 import { fetchWebSourceMaps } from "./WebSourceMapFetcher.js";
 import { authorizeCdpTarget } from "./CdpAuthorizedTarget.js";
 import { observeCdpSession } from "./CdpObservationSession.js";
@@ -93,9 +93,31 @@ const CLEANUP_DOMAINS = [
 /** Passive browser observation through a selected user-owned CDP endpoint. */
 export class CdpBrowserProvider implements BrowserObservationPort {
   readonly #owner = new CdpTargetSessionOwner();
+  readonly #bundleAnalyzer = new IsolatedWebBundleAnalyzer();
 
-  close(): Promise<void> {
-    return this.#owner.close();
+  async close(): Promise<void> {
+    const outcomes = await Promise.allSettled([
+      this.#owner.close(),
+      this.#bundleAnalyzer.close(),
+    ]);
+    const failures = outcomes.flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason as unknown] : [],
+    );
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      const typed = failures.filter(
+        (failure): failure is AnalysisError => failure instanceof AnalysisError,
+      );
+      throw new ProviderCleanupError(
+        CDP_BROWSER_PROVIDER_IDENTITY.id,
+        typed.flatMap((failure) => failure.cleanupResources),
+        { reason: "Browser transport and analyzer cleanup remain incomplete" },
+        {
+          operation: "analyze_web_bundle",
+          cause: new AggregateError(failures),
+        },
+      ).bindCleanupDependencies(typed);
+    }
   }
 
   identity(): ProviderIdentity {
@@ -166,6 +188,8 @@ export class CdpBrowserProvider implements BrowserObservationPort {
     input: AnalyzeWebBundleInput,
     options: ExecutionOptions = {},
   ): Promise<Result<WebBundleAnalysis, AnalysisError>> {
+    const admission = await this.#bundleAnalyzer.reserve();
+    if (!admission.ok) return admission;
     let captured: CapturedPage | undefined;
     try {
       captured = await this.#capture(input, options, "analyze_web_bundle");
@@ -182,10 +206,16 @@ export class CdpBrowserProvider implements BrowserObservationPort {
             options.signal,
           )
         : undefined;
-      return ok(
-        webBundleAnalysisSchema.parse(
-          analyzeCapturedWebBundle(captured.inspection, sourceMaps),
-        ),
+      return await this.#bundleAnalyzer.analyze(
+        captured.inspection,
+        sourceMaps ?? {
+          status: "not_requested",
+          requested: 0,
+          processed: 0,
+          items: [],
+        },
+        input,
+        options.signal,
       );
     } catch (cause: unknown) {
       // fetchWebSourceMaps rethrows the exact abort reason. Preserve cancellation
@@ -201,6 +231,8 @@ export class CdpBrowserProvider implements BrowserObservationPort {
         );
       }
       return err(providerError(cause, "analyze_web_bundle", options.signal));
+    } finally {
+      this.#bundleAnalyzer.releaseReservation();
     }
   }
 
@@ -328,7 +360,7 @@ interface CdpTargetOperationSession<Input> {
 const withTargetSession = async <
   Input extends Pick<
     InspectWebPageInput,
-    "cdp_endpoint" | "target_id" | "allowed_origins"
+    "cdp_endpoint" | "target_id" | "allowed_origins" | "command_timeout_ms"
   >,
   Output,
 >(
@@ -339,19 +371,31 @@ const withTargetSession = async <
   owner: CdpTargetSessionOwner,
   partialObservation?: (output: Output) => AnalysisPartialObservation,
 ): Promise<Output> => {
+  const commandTimeoutMs = selectedCdpCommandTimeoutMs(
+    input.command_timeout_ms,
+  );
   const endpoint = await openCdpEndpoint(
     input.cdp_endpoint,
     operation,
     options.signal,
     undefined,
     owner,
+    commandTimeoutMs,
   );
   let targetSession: CdpTargetSession | undefined;
   let outcome: Result<Output, unknown>;
   let cleanupFailure: AnalysisError | undefined;
   try {
-    const target = authorizeTarget(endpoint.discovery, input);
-    const scopedInput = scopeToTargetOrigin(input, target);
+    const { target, allowedOrigins } = authorizeCdpTarget(
+      endpoint.discovery,
+      input,
+      operation,
+    );
+    // The authorization owner already derived the target origin scope.
+    const scopedInput =
+      input.allowed_origins.length > 0
+        ? input
+        : { ...input, allowed_origins: [...allowedOrigins] };
     targetSession =
       endpoint.connection === undefined
         ? await openCdpTargetSession(
@@ -359,7 +403,7 @@ const withTargetSession = async <
             target,
             operation,
             options.signal,
-            undefined,
+            { commandTimeoutMs },
             owner,
           )
         : await attachCdpTargetSession(
@@ -512,31 +556,13 @@ const selectTargets = (
   };
 };
 
-const authorizeTarget = (
-  discovery: CdpEndpointDiscovery,
-  input: Pick<InspectWebPageInput, "target_id" | "allowed_origins">,
-): CdpEndpointTarget => {
-  return authorizeCdpTarget(discovery, input, "inspect_web_page").target;
-};
-
-const scopeToTargetOrigin = <T extends { allowed_origins: readonly string[] }>(
-  input: T,
-  target: CdpEndpointTarget,
-): T => {
-  if (input.allowed_origins.length > 0) return input;
-  const origin = sanitizeBrowserUrl(target.url).origin;
-  if (origin === null)
-    throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
-  return { ...input, allowed_origins: [origin] };
-};
-
 const providerError = (
   cause: unknown,
   operation: BrowserObservationOperation,
   signal?: AbortSignal,
 ): AnalysisError =>
-  cause instanceof BrowserObservationError && cause.operation !== operation
-    ? new BrowserObservationError(operation, cause.reason, { cause })
+  cause instanceof BrowserObservationError
+    ? cause.forOperation(operation)
     : cause instanceof AnalysisError
       ? cause
       : signal?.aborted === true

@@ -1,7 +1,10 @@
 import { Cli, z } from "incur";
 
 import { browserContext, browserCliError } from "../cliBrowserContext.js";
-import { browserScopeOptions } from "../cliObservationOptions.js";
+import {
+  browserScopeOptions,
+  selectedCommandTimeout,
+} from "../cliObservationOptions.js";
 import {
   captureWebScreenshot,
   compareWebCaptureEvidence,
@@ -17,7 +20,10 @@ import {
 import { compareBrowserScenariosInputSchema } from "../domain/browserScenarioDiffValues.js";
 import { browserScenarioCaptureSchema } from "../domain/browserScenarioCapture.js";
 import { compareWebCapturesInputSchema } from "../domain/webCaptureDiffSchemas.js";
-import { projectInputIssues } from "../domain/inputIssueProjection.js";
+import {
+  analysisInputErrorFromIssues,
+  projectInputIssues,
+} from "../domain/inputIssueProjection.js";
 import { discoverWebMcpToolsInputSchema } from "../domain/webMcpDiscovery.js";
 import {
   captureWebScreenshotInputSchema,
@@ -71,6 +77,7 @@ const registerWebMcp = (
             allowed_origins: options.allowedOrigins,
             target_id: args.targetId,
             observation_ms: options.observationMs,
+            ...selectedCommandTimeout(options.commandTimeoutMs),
           };
           const parsed = discoverWebMcpToolsInputSchema.safeParse(input);
           if (!parsed.success)
@@ -182,6 +189,7 @@ const registerScreenshot = (
             cdp_endpoint: args.endpoint,
             allowed_origins: options.allowedOrigins,
             target_id: args.targetId,
+            ...selectedCommandTimeout(options.commandTimeoutMs),
           };
           const parsed = captureWebScreenshotInputSchema.safeParse(input);
           if (!parsed.success)
@@ -246,10 +254,11 @@ const registerScreenshotDiff = (
         const parsed = compareWebScreenshotsInputSchema.safeParse(input);
         if (!parsed.success)
           return browserCliError(
-            new AnalysisInputError(
+            analysisInputErrorFromIssues(
               operation,
+              parsed.error.issues,
+              input,
               { cause: parsed.error },
-              projectInputIssues(parsed.error.issues, input),
             ),
           );
         const result = await compareWebScreenshotEvidence(

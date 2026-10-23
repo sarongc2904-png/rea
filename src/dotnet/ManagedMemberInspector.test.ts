@@ -5,6 +5,7 @@ import {
   ManagedDecodeBudget,
   managedDecodeBudget,
 } from "./ManagedDecodeBudget.js";
+import { metadataRowCursor, readMetadataBlob } from "./ManagedMetadataHeaps.js";
 import {
   metadataRowOffset,
   readManagedMetadataLayout,
@@ -41,6 +42,271 @@ const ldstrBody = (tokens: readonly string[]): Buffer => {
   return Buffer.concat([Buffer.from([(il.length << 2) | 2]), il]);
 };
 
+describe("managed method body anchors", () => {
+  it.each([
+    ["field", Buffer.from([0x06, 0x08]), "field"],
+    ["method", Buffer.from([0x00, 0x00, 0x01]), "method"],
+    ["unknown", Buffer.from([0x7f]), "token"],
+  ] as const)(
+    "classifies ldtoken MemberRefs from their parsed %s signature",
+    (_label, memberRefSignature, expectedKind) => {
+      const il = Buffer.from([0xd0, 1, 0, 0, 0x0a, 0x26, 0x2a]);
+      const bytes = buildManagedPeFixture({
+        targetFramework: null,
+        memberRefName: "Counter",
+        memberRefParentRaw: 8,
+        memberRefSignature,
+        ilBody: Buffer.concat([Buffer.from([(il.length << 2) | 2]), il]),
+      });
+      const result = inspectManagedMembersBytes(
+        bytes,
+        managedPeFixtureTarget(bytes),
+      );
+
+      expect(result.member_refs[0]?.signature.kind).toBe(
+        expectedKind === "token" ? "unknown" : expectedKind,
+      );
+      expect(result.methods[0]?.body.anchors[0]).toMatchObject({
+        opcode: "ldtoken",
+        operand_kind: expectedKind,
+        operand: "0x0a000001",
+      });
+      expect(result.call_edges).toEqual([]);
+      expect(result.field_accesses).toEqual([]);
+    },
+  );
+
+  it("keeps operand-free instructions in anchors so branch comparison constants stay recoverable", () => {
+    // ldloc.s 4; ldc.i4.4; bne.un.s +0; ret. The constant this branch compares
+    // against is carried by the operand-free ldc.i4.4 opcode itself, so the
+    // anchors must retain the instruction rather than only its operand.
+    const il = Buffer.from([0x11, 0x04, 0x1a, 0x33, 0x00, 0x2a]);
+    const bytes = buildManagedPeFixture({
+      ilBody: Buffer.concat([Buffer.from([(il.length << 2) | 2]), il]),
+    });
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+
+    expect(result.methods[0]?.body.opcode_counts).toEqual({
+      "ldloc.s": 1,
+      "ldc.i4.4": 1,
+      "bne.un.s": 1,
+      ret: 1,
+    });
+    expect(result.methods[0]?.body.anchors).toEqual([
+      {
+        il_offset: 0,
+        opcode: "ldloc.s",
+        operand_kind: "variable",
+        operand: "4",
+      },
+      {
+        il_offset: 2,
+        opcode: "ldc.i4.4",
+        operand_kind: "none",
+        operand: null,
+      },
+      {
+        il_offset: 3,
+        opcode: "bne.un.s",
+        operand_kind: "branch",
+        operand: "5",
+      },
+      {
+        il_offset: 5,
+        opcode: "ret",
+        operand_kind: "none",
+        operand: null,
+      },
+    ]);
+  });
+});
+
+it.each([0x06000001, 0x11000001])(
+  "marks an invalid LocalVarSigTok %s malformed without losing CIL",
+  (token) => {
+    const body = Buffer.alloc(13);
+    body.writeUInt16LE(0x3003, 0);
+    body.writeUInt16LE(8, 2);
+    body.writeUInt32LE(1, 4);
+    body[12] = 0x2a;
+    const bytes = buildManagedPeFixture({ ilBody: body });
+    const initial = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+    const offset = initial.methods[0]?.body.file_offset;
+    if (offset === null || offset === undefined)
+      throw new Error("fixture body has no offset");
+    bytes.writeUInt32LE(token, offset + 8);
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+    expect(result.methods[0]?.body).toMatchObject({
+      status: "malformed",
+      local_var_sig_token: `0x${token.toString(16).padStart(8, "0")}`,
+      anchors: expect.arrayContaining([
+        expect.objectContaining({ opcode: "ret" }),
+      ]),
+    });
+    expect(result.coverage).toMatchObject({
+      state: "partial",
+      issues: [
+        expect.objectContaining({ code: "invalid-row", offset: offset + 8 }),
+      ],
+    });
+  },
+);
+
+it.each([
+  ["valid LocalVarSig", Buffer.from([0x07, 0x01, 0x08]), "present"],
+  [
+    "valid pinned LocalVarSig",
+    Buffer.from([0x07, 0x01, 0x45, 0x08]),
+    "present",
+  ],
+  [
+    "valid pinned by-reference LocalVarSig",
+    Buffer.from([0x07, 0x01, 0x45, 0x10, 0x08]),
+    "present",
+  ],
+  [
+    "valid pinned pointer with a nested custom modifier",
+    Buffer.from([0x07, 0x01, 0x45, 0x0f, 0x1f, 0x04, 0x08]),
+    "present",
+  ],
+  [
+    "valid pinned function pointer with a TYPEDBYREF return",
+    Buffer.from([0x07, 0x01, 0x45, 0x1b, 0x00, 0x00, 0x16]),
+    "present",
+  ],
+  ["wrong signature kind", Buffer.from([0x00, 0x00, 0x01]), "malformed"],
+  ["truncated LocalVarSig", Buffer.from([0x07, 0x01]), "malformed"],
+] as const)(
+  "checks the StandAloneSig payload kind: %s",
+  (_name, standaloneSignature, status) => {
+    const body = Buffer.alloc(13);
+    body.writeUInt16LE(0x3003, 0);
+    body.writeUInt16LE(8, 2);
+    body.writeUInt32LE(1, 4);
+    body.writeUInt32LE(0x11000001, 8);
+    body[12] = 0x2a;
+    const bytes = buildManagedPeFixture({
+      ilBody: body,
+      standaloneSignatures: [standaloneSignature],
+    });
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+    expect(result.methods[0]?.body.status).toBe(status);
+    if (status === "present")
+      expect(result.coverage).toMatchObject({ state: "complete", issues: [] });
+    else
+      expect(result.coverage).toMatchObject({
+        state: "partial",
+        issues: [expect.objectContaining({ code: expect.any(String) })],
+      });
+  },
+);
+
+it.each([
+  [
+    "void local element",
+    Buffer.from([0x07, 0x01, 0x01]),
+    "malformed",
+    "invalid-blob",
+    2,
+  ],
+  [
+    "local modifier after PINNED constraint",
+    Buffer.from([0x07, 0x01, 0x45, 0x1f, 0x04, 0x08]),
+    "malformed",
+    "invalid-blob",
+    3,
+  ],
+  [
+    "PINNED typed reference local",
+    Buffer.from([0x07, 0x01, 0x45, 0x16]),
+    "malformed",
+    "invalid-blob",
+    3,
+  ],
+  [
+    "trailing signature data",
+    Buffer.from([0x07, 0x01, 0x08, 0xff]),
+    "malformed",
+    "invalid-blob",
+    3,
+  ],
+  [
+    "unsupported local element",
+    Buffer.from([0x07, 0x01, 0xff]),
+    "partial",
+    "unsupported-signature",
+    2,
+  ],
+  [
+    "zero local count with trailing byte",
+    Buffer.from([0x07, 0x00, 0xff]),
+    "malformed",
+    "invalid-blob",
+    1,
+  ],
+] as const)(
+  "preserves CIL and reports %s at its source byte",
+  (_name, standaloneSignature, status, code, localOffset) => {
+    const body = Buffer.alloc(13);
+    body.writeUInt16LE(0x3003, 0);
+    body.writeUInt16LE(8, 2);
+    body.writeUInt32LE(1, 4);
+    body.writeUInt32LE(0x11000001, 8);
+    body[12] = 0x2a;
+    const bytes = buildManagedPeFixture({
+      ilBody: body,
+      standaloneSignatures: [standaloneSignature],
+    });
+    const pe = readManagedPeLayout(bytes);
+    if (pe.cli === null) throw new Error("fixture has no CLI header");
+    const layout = readManagedMetadataLayout(
+      bytes,
+      pe.rvaToOffset(pe.cli.metadata.rva, pe.cli.metadata.size, "metadata"),
+      pe.cli.metadata.size,
+    );
+    const row = metadataRowCursor(bytes, layout, 17, 1);
+    const blob = readMetadataBlob(
+      bytes,
+      layout,
+      row.readIndex(layout.blobIndexSize),
+      layout.blob?.size ?? 0,
+    );
+    const blobOffset = blob.byteOffset - bytes.byteOffset;
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+    expect(result.methods[0]?.body).toMatchObject({
+      status,
+      anchors: expect.arrayContaining([
+        expect.objectContaining({ opcode: "ret" }),
+      ]),
+    });
+    expect(result.coverage).toMatchObject({
+      state: "partial",
+      issues: [
+        expect.objectContaining({
+          code,
+          scope: "metadata.StandAloneSig:0x11000001.signature",
+          offset: blobOffset + localOffset,
+        }),
+      ],
+    });
+  },
+);
+
 describe("managed member inspection", () => {
   it("keeps metadata handles distinct from calls and field accesses", () => {
     const il = Buffer.from([
@@ -56,7 +322,7 @@ describe("managed member inspection", () => {
     );
 
     expect(result.methods[0]?.body.anchors.map(({ opcode }) => opcode)).toEqual(
-      ["ldtoken", "ldtoken", "call", "ldfld"],
+      ["ldtoken", "pop", "ldtoken", "pop", "call", "ldfld", "pop", "ret"],
     );
     expect(result.call_edges.map(({ opcode }) => opcode)).toEqual(["call"]);
     expect(result.field_accesses.map(({ opcode }) => opcode)).toEqual([
@@ -119,6 +385,12 @@ describe("managed member inspection", () => {
           opcode_counts: { "ldarg.0": 1, ldfld: 1, call: 1, ret: 1 },
           anchors: [
             {
+              il_offset: 0,
+              opcode: "ldarg.0",
+              operand_kind: "none",
+              operand: null,
+            },
+            {
               il_offset: 1,
               opcode: "ldfld",
               operand_kind: "field",
@@ -129,6 +401,12 @@ describe("managed member inspection", () => {
               opcode: "call",
               operand_kind: "method",
               operand: "0x0a000001",
+            },
+            {
+              il_offset: 11,
+              opcode: "ret",
+              operand_kind: "none",
+              operand: null,
             },
           ],
         }),
@@ -699,7 +977,7 @@ describe("managed exported types", () => {
 
     expect(parsed.exported_types).toBeNull();
     expect(comparisonLimitations(parsed, parsed)).toContain(
-      "At least one managed member observation predates ExportedType inspection; its exported and forwarded types are unknown.",
+      "At least one managed member observation did not examine ExportedType rows; its exported and forwarded types are unknown.",
     );
   });
 
@@ -768,12 +1046,20 @@ describe("managed user strings", () => {
       issues: [],
     });
     const body = result.methods[0]?.body;
+    // Each ldstr is followed by an operand-free pop, and ret ends the body;
+    // anchors keep those null-operand instructions too.
     expect(body?.anchors.map(({ operand }) => operand)).toEqual([
       unicode,
+      null,
       path,
+      null,
       lone,
+      null,
       path,
+      null,
       empty,
+      null,
+      null,
     ]);
     expect(body?.normalized_il_sha256).toBe(
       inspect({ ilBody }).methods[0]?.body.normalized_il_sha256,
@@ -1195,7 +1481,7 @@ describe("managed member decoding budget", () => {
     });
   });
 
-  it("still rejects dense one-byte instructions before exceeding capacity", () => {
+  it("rejects dense one-byte instructions while retaining admitted types", () => {
     // All NOPs: unlike wide instructions, each IL byte adds a decoded record.
     // A true oversized transient must remain an actionable resource limit.
     const il = Buffer.alloc(270_001);
@@ -1213,12 +1499,12 @@ describe("managed member decoding budget", () => {
     );
 
     expect(result.coverage).toMatchObject({
-      state: "unavailable",
+      state: "partial",
       issues: [{ code: "resource-limit", scope: "metadata.representation" }],
     });
     // Report the originating IL coordinate, not a generic decoding error.
     expect(result.coverage.issues[0]?.offset).toBeGreaterThan(0);
-    expect(result.types).toEqual([]);
+    expect(result.types).toHaveLength(1);
     expect(result.methods).toEqual([]);
   });
 
@@ -1269,9 +1555,11 @@ describe("managed member decoding budget", () => {
     );
 
     expect(result.coverage).toMatchObject({
-      state: "unavailable",
+      state: "partial",
       issues: [{ code: "resource-limit" }],
     });
+    expect(result.methods).toEqual([]);
+    expect(result.types).toHaveLength(1);
   });
 });
 
@@ -1661,6 +1949,33 @@ it("decodes generic instantiation member signatures as complete coverage", () =>
 });
 
 it.each([
+  ["reserved TypeDefOrRef tag", Buffer.from([0x06, 0x12, 0x07])],
+  ["missing TypeSpec row", Buffer.from([0x06, 0x12, 0x06])],
+])(
+  "retains a field with an invalid signature type operand: %s",
+  (_name, fieldSignature) => {
+    const bytes = buildManagedPeFixture({ fieldSignature });
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+    expect(result.fields[0]).toMatchObject({
+      name: "counter",
+      signature: { kind: "field", parse_status: "malformed", field_type: null },
+    });
+    expect(result.coverage).toMatchObject({
+      state: "partial",
+      issues: [
+        expect.objectContaining({
+          code: "invalid-row",
+          scope: "Field:0x04000001.signature",
+        }),
+      ],
+    });
+  },
+);
+
+it.each([
   ["single-dimension general array", [0x14, 0x08, 0x01, 0x00, 0x00], "i4[...]"],
   [
     "sized array with signed lower bounds",
@@ -1789,6 +2104,42 @@ it("decodes typed references in parameter and return positions", () => {
   ).toMatchObject({
     parse_status: "decoded",
     field_type: "fnptr[default has-this](typedbyref)->void",
+  });
+});
+
+it("decodes VARARG optional parameters in method and function-pointer signatures", () => {
+  expect(
+    signature(Buffer.from([0x05, 0x02, 0x01, 0x08, 0x41, 0x0e])),
+  ).toMatchObject({
+    kind: "method",
+    parse_status: "decoded",
+    parameter_count: 2,
+    parameter_types: ["i4", "string"],
+  });
+  expect(
+    signature(Buffer.from([0x06, 0x1b, 0x05, 0x02, 0x01, 0x08, 0x41, 0x0e])),
+  ).toMatchObject({
+    kind: "field",
+    parse_status: "decoded",
+    field_type: "fnptr[vararg](i4,string)->void",
+  });
+});
+
+it.each([
+  [
+    "sentinel in a DEFAULT signature",
+    [0x00, 0x01, 0x01, 0x41, 0x08],
+    "unsupported",
+  ],
+  [
+    "duplicate VARARG sentinels",
+    [0x05, 0x02, 0x01, 0x41, 0x41, 0x08],
+    "malformed",
+  ],
+])("does not accept %s as a valid method signature", (_name, bytes, status) => {
+  expect(signature(Buffer.from(bytes))).toMatchObject({
+    kind: "unknown",
+    parse_status: status,
   });
 });
 

@@ -20,6 +20,7 @@ interface ParsedSegment {
 }
 
 interface ParsedLoadCommands {
+  readonly cpuType: number | null;
   readonly commands: Array<{
     index: number;
     kind: string;
@@ -41,6 +42,7 @@ interface ParsedLoadCommands {
   }>;
   uuid: string | null;
   readonly flags: Set<string>;
+  readonly omittedDependencyCommands: string[];
 }
 
 const DYLIB_COMMANDS = new Set([
@@ -51,6 +53,11 @@ const DYLIB_COMMANDS = new Set([
   "LC_LAZY_LOAD_DYLIB",
   "LC_LOAD_UPWARD_DYLIB",
 ]);
+/**
+ * Dependency commands whose install name is not in the otool command text.
+ * `LC_LAZY_LOAD_DYLIB_INFO` stores it in a linkedit payload.
+ */
+const PAYLOAD_DEPENDENCY_COMMANDS = new Set(["LC_LAZY_LOAD_DYLIB_INFO"]);
 
 const DYLIB_FIELDS = [
   "cmd",
@@ -129,7 +136,7 @@ export const parseOtoolLoadCommands = (raw: string) => {
   const header = parseHeader(output);
   if (header === undefined)
     throw new TypeError("otool output is missing the Mach header");
-  const state = createLoadCommandState(header.flags);
+  const state = createLoadCommandState(header.flags, header.cpuType);
   for (const block of output.split(/(?=^Load command \d+$)/mu))
     parseLoadCommand(block, state);
   validateLoadCommandFraming(header, state.commands);
@@ -142,6 +149,7 @@ export const parseOtoolLoadCommands = (raw: string) => {
     commands: state.commands,
     segments: state.segments,
     dependencies: state.dependencies,
+    omittedDependencyCommands: state.omittedDependencyCommands,
     entrypoints: state.entrypoints,
     builds: state.builds,
   };
@@ -257,7 +265,9 @@ const validateLoadCommandFraming = (
 
 const createLoadCommandState = (
   headerFlags: readonly string[] | undefined,
+  cpuType: number | null,
 ): ParsedLoadCommands => ({
+  cpuType,
   commands: [],
   segments: [],
   dependencies: [],
@@ -265,6 +275,7 @@ const createLoadCommandState = (
   builds: [],
   uuid: null,
   flags: new Set(headerFlags ?? []),
+  omittedDependencyCommands: [],
 });
 
 const parseLoadCommand = (block: string, state: ParsedLoadCommands): void => {
@@ -290,6 +301,8 @@ const parseLoadCommand = (block: string, state: ParsedLoadCommands): void => {
   collectEntrypoint(kind, fields, state);
   collectBuild(kind, block, fields, state);
   collectDependency(kind, fields, state);
+  if (PAYLOAD_DEPENDENCY_COMMANDS.has(kind))
+    state.omittedDependencyCommands.push(kind);
   collectSegment(kind, block, fields, state);
 };
 
@@ -393,13 +406,33 @@ const collectBuild = (
     });
     return;
   }
-  if (kind.startsWith("LC_VERSION_MIN_"))
+  if (kind.startsWith("LC_VERSION_MIN_")) {
+    const platform = kind.slice("LC_VERSION_MIN_".length) || null;
     state.builds.push({
-      platform: kind.slice("LC_VERSION_MIN_".length) || null,
+      platform: legacySimulatorPlatform(platform, state.cpuType),
       minimum_os: stringField(fields, "version"),
       sdk: stringField(fields, "sdk"),
       tools: [],
     });
+  }
+};
+
+// Apple dyld interprets legacy iOS/tvOS/watchOS minimum-version commands on
+// Intel slices as simulator platforms. Newer commands encode this directly.
+const legacySimulatorPlatform = (
+  platform: string | null,
+  cpuType: number | null,
+): string | null => {
+  if (![7, 0x01000007].includes(cpuType ?? -1)) return platform;
+  return (
+    (
+      {
+        IPHONEOS: "IOSSIMULATOR",
+        TVOS: "TVOSSIMULATOR",
+        WATCHOS: "WATCHOSSIMULATOR",
+      } as const
+    )[platform as "IPHONEOS" | "TVOS" | "WATCHOS"] ?? platform
+  );
 };
 
 const collectDependency = (
@@ -467,14 +500,29 @@ const parseFields = (block: string): ParsedFields => {
 /** Names and linker options are text even when they look numeric. */
 const TEXT_FIELDS = /^(?:segname|sectname|string #\d+)$/u;
 
+/**
+ * otool prints load-command strings as `<key> %s (offset %u)`: exactly one
+ * separator space on each side of the recorded string, whose own leading and
+ * trailing whitespace belongs to the Mach-O value.
+ */
+const OFFSET_STRING_FIELD = /^(name|path) (.* \(offset \d+\))$/u;
+
 const parseField = (rawLine: string): readonly [string, string] | undefined => {
+  const offsetString = OFFSET_STRING_FIELD.exec(rawLine.trimStart());
+  if (offsetString?.[1] !== undefined && offsetString[2] !== undefined)
+    return [offsetString[1], offsetString[2]];
   // otool prints each linker option as `string #n <option>`; keep the option
   // exactly, including surrounding spaces, under otool's ordinal label.
   const option = /^\s*(string #[1-9]\d*)(?: (.*))?$/u.exec(rawLine);
   if (option?.[1] !== undefined) return [option[1], option[2] ?? ""];
   const line = rawLine.trim();
-  // Match time stamp as a whole without swallowing `name stamp plugin.dylib`.
-  const match = /^((?:time stamp)|\S+(?:\s+version)?)(?:\s+(.+))?$/u.exec(line);
+  // These are the compound field labels used by otool. Keeping this list
+  // explicit prevents a one-word field value such as `sectname version` from
+  // being consumed as an invented `sectname version` key.
+  const match =
+    /^(time stamp|current version|compatibility version|\S+)(?:\s+(.+))?$/u.exec(
+      line,
+    );
   return match?.[1] === undefined
     ? undefined
     : [match[1], match[2]?.trim() ?? ""];
@@ -625,7 +673,7 @@ const hexField = (
 };
 
 const stripOffsetSuffix = (value: string | null): string =>
-  value?.replace(/\s+\(offset\s+\d+\)$/u, "") ?? "unknown";
+  value?.replace(/ \(offset \d+\)$/u, "") ?? "unknown";
 
 const sectionAlignment = (raw: string | null): number | null => {
   if (raw === null) return null;

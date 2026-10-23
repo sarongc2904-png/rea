@@ -14,8 +14,8 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import {
   assertRizinProcessStartTimeStable,
-  parseRizinProcStartTime,
   RizinDebugSessionManager,
+  truncateUtf8,
 } from "../../../src/rizin/RizinDebugSessionManager.js";
 import { evidenceSchema } from "../../../src/domain/evidence.js";
 import { TOOL_EFFECTS } from "../../../src/contracts/toolEffects.js";
@@ -307,21 +307,33 @@ it.skipIf(process.platform !== "linux")(
   4_000,
 );
 
-it("parses Rizin's Linux proc stat start time and rejects malformed identity data", () => {
-  const fields = Array.from({ length: 20 }, (_, index) => String(index + 1));
-  expect(
-    parseRizinProcStartTime(`123 (target ) name) ${fields.join(" ")}`),
-  ).toBe("20");
-  expect(() => parseRizinProcStartTime("malformed stat contents")).toThrow(
-    "Inferior process identity is malformed",
-  );
-  expect(() => parseRizinProcStartTime("123 (target) short")).toThrow(
-    "Inferior process start time could not be verified",
-  );
+it("rejects changed or missing Rizin inferior identity during detach", () => {
   expect(() => assertRizinProcessStartTimeStable("11", "12")).toThrow(
     "disappeared or was reused",
   );
   expect(() => assertRizinProcessStartTimeStable("11", "11")).not.toThrow();
+  expect(() => assertRizinProcessStartTimeStable("11", null)).toThrow(
+    "disappeared or was reused",
+  );
+});
+
+it("truncates UTF-8 strings by byte limit preserving multi-byte code point boundaries", () => {
+  expect(truncateUtf8("", 10)).toBe("");
+  expect(truncateUtf8("hello", 0)).toBe("");
+  expect(truncateUtf8("hello", -1)).toBe("");
+  expect(truncateUtf8("hello", 3)).toBe("hel");
+  expect(truncateUtf8("hello", 10)).toBe("hello");
+
+  // Multibyte 3-byte CJK character (0xe6 0x96 0x87)
+  // 5 bytes allows only 1 character (3 bytes); the second character would need 6 bytes
+  expect(truncateUtf8("中文", 5)).toBe("中");
+  expect(truncateUtf8("中文", 6)).toBe("中文");
+
+  // 4-byte emoji (🚀 = 0xf0 0x9f 0x9a 0x80)
+  expect(truncateUtf8("🚀🚀", 3)).toBe("");
+  expect(truncateUtf8("🚀🚀", 4)).toBe("🚀");
+  expect(truncateUtf8("🚀🚀", 7)).toBe("🚀");
+  expect(truncateUtf8("🚀🚀", 8)).toBe("🚀🚀");
 });
 
 it.skipIf(process.platform !== "linux")(

@@ -1,4 +1,6 @@
 import pino from "pino";
+import type { CallToolResult } from "@modelcontextprotocol/server";
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -131,11 +133,9 @@ it("invalidates the snapshot in the legacy Rizin admission path", async () => {
 it("skips snapshot invalidation for malformed Rizin input", async () => {
   const { server, handler } = createReverseEngineeringMcpHarness();
   const invalidateSnapshot = vi.fn();
-  const executeRizinCommand = vi.fn(async () =>
-    err(new AnalysisInputError("execute_rizin_command")),
-  );
+  const executeRizinCommandValidated = vi.fn();
   const service = {
-    executeRizinCommand,
+    executeRizinCommandValidated,
   } as unknown as ReverseEngineeringService;
   registerReverseEngineeringTools(
     server,
@@ -150,10 +150,17 @@ it("skips snapshot invalidation for malformed Rizin input", async () => {
 
   const response = (await invokeWithLiveSignal(invoke, {
     path: "package.json",
-  })) as { readonly isError?: boolean };
+  })) as CallToolResult;
 
-  expect(response.isError).toBe(true);
-  expect(executeRizinCommand).toHaveBeenCalledOnce();
+  expect(parseMcpToolError(response).error).toMatchObject({
+    code: "invalid_request",
+    details: {
+      issues: [
+        { path: ["command"], reason: "missing_argument", expected: "string" },
+      ],
+    },
+  });
+  expect(executeRizinCommandValidated).not.toHaveBeenCalled();
   expect(invalidateSnapshot).not.toHaveBeenCalled();
 });
 
@@ -186,10 +193,14 @@ it("delivers failed Rizin execution after external admission", async () => {
 
 it("preserves the Rizin operation error when analysis retirement also fails", async () => {
   const { server, handler } = createReverseEngineeringMcpHarness();
+  const reason = { stage: "operation-input" };
+  const primary = new AnalysisInputError("execute_rizin_command", {
+    cause: reason,
+  });
+  const retirement = new AnalysisInputError("rebind");
   const service = {
     retryCleanup: async () => ok(null),
-    executeRizinCommand: async () =>
-      err(new AnalysisInputError("execute_rizin_command")),
+    executeRizinCommandValidated: async () => err(primary),
   } as unknown as ReverseEngineeringService;
   const observedOperationResult = vi.fn();
   registerReverseEngineeringTools(
@@ -203,7 +214,7 @@ it("preserves the Rizin operation error when analysis retirement also fails", as
     async (_path, _signal, operation, rebindFailure) => {
       const result = await operation();
       observedOperationResult(result);
-      return err(rebindFailure(result, new AnalysisInputError("rebind")));
+      return err(rebindFailure(result, retirement));
     },
   );
   const invoke = handler("execute_rizin_command");
@@ -221,6 +232,8 @@ it("preserves the Rizin operation error when analysis retirement also fails", as
     };
   };
 
+  expect(primary.cause).toBe(reason);
+  expect(primary.secondaryFailures).toEqual([retirement]);
   expect(response.isError).toBe(true);
   expect(observedOperationResult).toHaveBeenCalledWith(
     expect.objectContaining({ ok: false }),
@@ -415,7 +428,7 @@ it("does not treat a malformed partial observation as retained Evidence", async 
   );
   const service = {
     inspectWithObjdump: async () => err(invalidError),
-    executeRizinCommand: async () => err(invalidError),
+    executeRizinCommandValidated: async () => err(invalidError),
   } as unknown as ReverseEngineeringService;
   const recordEvidence = vi.fn(() => ok("added" as const));
   registerReverseEngineeringTools(
@@ -483,7 +496,7 @@ it("returns admission failures without invoking a reverse-engineering provider",
   const inspectWithObjdump = vi.fn();
   const service = {
     inspectWithObjdump,
-    executeRizinCommand: vi.fn(),
+    executeRizinCommandValidated: vi.fn(),
   } as unknown as ReverseEngineeringService;
   const admission: WithAdmittedAnalysis = async () =>
     err(new AnalysisInputError("inspect_with_objdump"));

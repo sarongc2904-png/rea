@@ -1,3 +1,7 @@
+import { hasGodotPckHeader } from "../../domain/godotPckFormat.js";
+import type { ArtifactClassificationEvidence } from "../ArtifactClassificationProbe.js";
+import { asarHeaderAdmissionFailure } from "../AsarHeader.js";
+import { hasDestinationPath } from "../ArtifactPaths.js";
 import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 import { isJavaScriptSourcePath } from "../../domain/javascript/javascriptArtifactFiles.js";
 import { digestCanonicalValue } from "../../domain/canonicalDigest.js";
@@ -23,13 +27,11 @@ import {
   zipPackageFormatForPath,
   type ZipPackageFormat,
 } from "../../domain/zipPackageFormat.js";
-import {
-  observeMzWindowsHeader,
-  parseDosMzHeader,
-} from "../../domain/dosMz.js";
+import { parseMzHeaderEvidence } from "../../domain/dosMz.js";
 import {
   classifyFatContainerIdentity,
   readFatContainerHeader,
+  readMachoHeaderPrefixFacts,
 } from "../../domain/apple/machoContainer.js";
 
 /** Mutable internal occurrence used until root-bound IDs are known. */
@@ -47,15 +49,18 @@ export interface MutableOccurrence {
   encrypted: boolean;
   hash_status: ArtifactOccurrence["hash_status"];
   source_location: ArtifactOccurrence["source_location"];
+  declared_integrity?: NonNullable<ArtifactOccurrence["declared_integrity"]>;
+  format_metadata?: NonNullable<ArtifactOccurrence["format_metadata"]>;
   limitations: string[];
 }
 
-/** Index every occurrence by canonical logical path without choosing an owner. */
-export const indexOccurrencesByPath = (
+/** Index destination paths without mixing in declaration query names or choosing an owner. */
+export const indexDestinationOccurrencesByPath = (
   occurrences: readonly MutableOccurrence[],
 ): ReadonlyMap<string, readonly MutableOccurrence[]> => {
   const byPath = new Map<string, MutableOccurrence[]>();
   for (const occurrence of occurrences) {
+    if (!hasDestinationPath(occurrence.entry_kind)) continue;
     const matches = byPath.get(occurrence.logical_path);
     if (matches === undefined)
       byPath.set(occurrence.logical_path, [occurrence]);
@@ -76,16 +81,18 @@ export const createOccurrence = (
   duplicateOrdinal = 0,
 ): MutableOccurrence => {
   const role =
-    entry.kind === "directory"
-      ? {
-          kind: path.toLowerCase().endsWith(".framework")
-            ? ("framework" as const)
-            : ("container" as const),
-          format: "directory" as const,
-        }
-      : containerSuffixFamily(path) === undefined
-        ? classifyArtifactPath(path)
-        : ({ kind: "unknown", format: "unknown" } as const);
+    entry.kind === "metadata"
+      ? { kind: "package-metadata" as const, format: "unknown" as const }
+      : entry.kind === "directory"
+        ? {
+            kind: path.toLowerCase().endsWith(".framework")
+              ? ("framework" as const)
+              : ("container" as const),
+            format: "directory" as const,
+          }
+        : containerSuffixFamily(path) === undefined
+          ? classifyArtifactPath(path)
+          : ({ kind: "unknown", format: "unknown" } as const);
   return {
     occurrence_id: `occ_${digestCanonicalValue(
       duplicateOrdinal === 0
@@ -105,10 +112,18 @@ export const createOccurrence = (
     encrypted: entry.encrypted,
     hash_status: entry.encrypted ? "unavailable" : "not-hashed",
     source_location:
-      entry.byteOffset === null || entry.declaredSize === null
+      entry.encrypted ||
+      entry.byteOffset === null ||
+      entry.declaredSize === null
         ? null
         : { offset: entry.byteOffset, length: entry.declaredSize },
     limitations: [...entry.limitations],
+    ...(entry.declaredIntegrity === null
+      ? {}
+      : { declared_integrity: { ...entry.declaredIntegrity } }),
+    ...(entry.formatMetadata === undefined
+      ? {}
+      : { format_metadata: { ...entry.formatMetadata } }),
   };
 };
 
@@ -178,6 +193,7 @@ export const createRootNode = (input: {
     readonly sha256: string;
     readonly bytes: number;
     readonly prefix: Buffer;
+    readonly fatSliceHeaders?: ArtifactClassificationEvidence["fatSliceHeaders"];
   } | null;
   readonly occurrences: readonly MutableOccurrence[];
 }): ArtifactNode =>
@@ -202,7 +218,11 @@ export const createRootNode = (input: {
     format:
       input.digest === null
         ? "directory"
-        : classifyArtifactBytes(input.digest.prefix, input.digest.bytes),
+        : classifyArtifactBytes(
+            input.digest.prefix,
+            input.digest.bytes,
+            input.digest.fatSliceHeaders,
+          ),
     contentState: "materialized",
   });
 
@@ -229,6 +249,7 @@ export const rootOccurrenceFor = (
     readonly executable: boolean;
     readonly format: ArtifactOccurrence["artifact_format"];
     readonly path: string;
+    readonly formatMetadata?: ArtifactOccurrence["format_metadata"];
   },
 ): MutableOccurrence => ({
   occurrence_id: occurrenceIdForLocation({
@@ -243,16 +264,21 @@ export const rootOccurrenceFor = (
   artifact_kind:
     metadata.format === "directory" ||
     isZipPackageFormat(metadata.format) ||
-    ["asar", "dmg", "pkg"].includes(metadata.format)
+    ["asar", "godot-pck", "dmg", "pkg", "pyinstaller"].includes(metadata.format)
       ? "container"
       : artifactRoleForFormat(metadata.path, metadata.format).kind,
   artifact_format: metadata.format,
   declared_size: metadata.size,
   compressed_size: null,
   executable: metadata.executable,
-  encrypted: false,
+  encrypted:
+    metadata.formatMetadata?.kind === "godot-pck" &&
+    metadata.formatMetadata.directory_status === "encrypted",
   hash_status: "verified",
   source_location: null,
+  ...(metadata.formatMetadata === undefined
+    ? {}
+    : { format_metadata: metadata.formatMetadata }),
   limitations: [],
 });
 
@@ -291,7 +317,7 @@ export const createArtifactEdges = (
   producer?: ArtifactCommand,
 ): { readonly edges: ArtifactEdge[]; readonly limitations: string[] } => {
   const byId = new Map(occurrences.map((item) => [item.occurrence_id, item]));
-  const byPath = indexOccurrencesByPath(occurrences);
+  const byPath = indexDestinationOccurrencesByPath(occurrences);
   const edges: ArtifactEdge[] = [];
   const limitations: string[] = [];
   for (const occurrence of occurrences) {
@@ -339,11 +365,14 @@ export const createArtifactEdges = (
       relation:
         occurrence.entry_kind === "slice"
           ? ("slice-of" as const)
-          : isSourceMap
-            ? mappedSource === undefined
-              ? ("contains" as const)
-              : ("maps-source" as const)
-            : relationFor(occurrence.logical_path),
+          : occurrence.format_metadata?.kind === "pyinstaller-entry" &&
+              occurrence.format_metadata.bytecode_header === "derived"
+            ? ("derived-from" as const)
+            : isSourceMap
+              ? mappedSource === undefined
+                ? ("contains" as const)
+                : ("maps-source" as const)
+              : relationFor(occurrence.logical_path),
       occurrence_id: occurrence.occurrence_id,
     };
     edges.push({
@@ -403,6 +432,9 @@ export const resolveOccurrenceParents = (
   const limitations = new Set<string>();
   const unknownParentOccurrences = new Set<MutableOccurrence>();
   for (const occurrence of occurrences) {
+    // Query paths do not imply filesystem containment. The scanner records
+    // the declaring container for metadata instead.
+    if (occurrence.entry_kind === "metadata") continue;
     const path = occurrence.logical_path;
     let branch = root;
     let parent: MutableOccurrence | undefined;
@@ -473,13 +505,14 @@ export const classifyArtifactPath = (
 /** Classify executable formats from bytes while retaining path-specific roles. */
 export const classifyArtifactContent = (
   path: string,
-  prefix: Buffer,
-  fileSize = prefix.length,
+  evidence: ArtifactClassificationEvidence,
+  fileSize = evidence.prefix.length,
 ): {
   readonly kind: ArtifactOccurrence["artifact_kind"];
   readonly format: ArtifactOccurrence["artifact_format"];
 } => {
-  const format = classifyArtifactBytes(prefix, fileSize);
+  const { prefix, asarHeader, fatSliceHeaders } = evidence;
+  const format = classifyArtifactBytes(prefix, fileSize, fatSliceHeaders);
   const byPath = classifyArtifactPath(path);
   if (
     format === "plist" &&
@@ -491,25 +524,14 @@ export const classifyArtifactContent = (
   if (
     format === "file" &&
     path.toLowerCase().endsWith(".asar") &&
-    hasAsarHeader(prefix)
-  )
-    return { kind: "container", format: "asar" };
+    asarHeader.state !== "rejected"
+  ) {
+    if (asarHeader.state === "limit")
+      throw asarHeaderAdmissionFailure(asarHeader.admission);
+    if (asarHeader.state === "matched")
+      return { kind: "container", format: "asar" };
+  }
   return artifactRoleForFormat(path, format);
-};
-
-/**
- * Electron ASAR starts with a size pickle whose payload is one uint32, then
- * a header pickle whose payload begins with a JSON object.
- */
-export const hasAsarHeader = (prefix: Buffer): boolean => {
-  if (prefix.length < 17 || prefix.readUInt32LE(0) !== 4) return false;
-  const headerSize = prefix.readUInt32LE(4);
-  const payloadSize = prefix.readUInt32LE(8);
-  if (headerSize < 16 || payloadSize !== headerSize - 4) return false;
-  const stringLength = prefix.readUInt32LE(12);
-  return (
-    stringLength >= 2 && stringLength <= payloadSize - 4 && prefix[16] === 0x7b
-  );
 };
 
 const artifactRoleForFormat = (
@@ -525,6 +547,7 @@ const artifactRoleForFormat = (
       format: zipPackageFormatForPath(path) ?? format,
     };
   if (format === "plist") return { kind: "plist", format };
+  if (format === "godot-pck") return { kind: "container", format };
   return {
     kind: ["native-addon", "dynamic-library"].includes(byPath.kind)
       ? byPath.kind
@@ -537,11 +560,13 @@ const artifactRoleForFormat = (
 export const classifyArtifactBytes = (
   prefix: Buffer,
   fileSize = prefix.length,
+  fatSliceHeaders?: ArtifactClassificationEvidence["fatSliceHeaders"],
 ): ArtifactNode["format"] => {
   if (hasZipSignature(prefix)) return "zip";
+  if (hasGodotPckHeader(prefix)) return "godot-pck";
   if (hasBinaryPlistSignature(prefix)) return "plist";
   if (hasXmlPlistSignature(prefix)) return "plist";
-  const fatFormat = classifyFatArtifact(prefix, fileSize);
+  const fatFormat = classifyFatArtifact(prefix, fileSize, fatSliceHeaders);
   if (fatFormat !== null) return fatFormat;
   if (prefix.length >= 4) {
     const magic = prefix.readUInt32BE(0);
@@ -557,8 +582,10 @@ export const classifyArtifactBytes = (
       prefix.length < Math.min(fileSize, 64)
     )
       return "unknown";
-    const windowsHeader = observeMzWindowsHeader(prefix, fileSize);
+    const evidence = parseMzHeaderEvidence(prefix, fileSize);
+    const { windowsHeader } = evidence;
     if (windowsHeader.state === "signature-needed") return "unknown";
+    if (windowsHeader.state === "candidate") return "unknown";
     if (windowsHeader.state === "declared") {
       const windowsOffset = windowsHeader.offset;
       if (
@@ -569,7 +596,7 @@ export const classifyArtifactBytes = (
         return "pe";
       return "unknown";
     }
-    if (parseDosMzHeader(prefix, fileSize).ok) return "dos-mz";
+    if (evidence.dos.ok) return "dos-mz";
     return "unknown";
   }
   return "file";
@@ -578,15 +605,27 @@ export const classifyArtifactBytes = (
 const classifyFatArtifact = (
   prefix: Buffer,
   fileSize: number,
+  fatSliceHeaders?: ArtifactClassificationEvidence["fatSliceHeaders"],
 ): ArtifactNode["format"] | null => {
-  const fatHeader = readFatContainerHeader(prefix, fileSize);
+  const fatHeader =
+    fatSliceHeaders?.header ?? readFatContainerHeader(prefix, fileSize);
   if (fatHeader.state === "needs-data" || fatHeader.state === "malformed")
     return "unknown";
   if (fatHeader.state === "not-fat") return null;
   const identity = classifyFatContainerIdentity(fatHeader, (offset) => {
-    if (offset >= prefix.length) return undefined;
-    if (offset + 4 > prefix.length) return null;
-    return prefix.readUInt32BE(offset);
+    if (fatSliceHeaders?.sliceHeadersByOffset.has(offset) === true)
+      return fatSliceHeaders.sliceHeadersByOffset.get(offset)?.magic;
+    const slice = fatHeader.slices.find(
+      (candidate) => candidate.offset === offset,
+    );
+    if (slice === undefined || offset >= prefix.length) return undefined;
+    const available = Math.max(
+      0,
+      Math.min(slice.size, prefix.length - offset, 12),
+    );
+    return readMachoHeaderPrefixFacts(
+      prefix.subarray(offset, offset + available),
+    ).magic;
   });
   return identity.state === "mach-o" ? "mach-o-universal" : "unknown";
 };

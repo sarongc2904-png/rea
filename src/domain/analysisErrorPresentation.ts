@@ -31,12 +31,20 @@ import { ProviderSelectionError } from "./providerSelectionError.js";
 import { ProviderAdapterError } from "./providerAdapterError.js";
 import { UnknownRegistryError } from "./unknownRegistryError.js";
 import { providerRetryAction } from "./providerOperationHealth.js";
+import { fixedAllowanceRemediation } from "./fixedAllowanceRemediation.js";
 import {
   resolvedAnalysisError,
   type AnalysisError,
   type AnalysisErrorTag,
 } from "./analysisErrorBase.js";
 import type { AnalysisErrorProjection } from "./analysisErrorProjection.js";
+
+/** File export when one MCP frame cannot carry the retained session bundle. */
+export const MCP_TRANSPORT_EVIDENCE_EXPORT =
+  "Export complete retained session evidence through export_evidence_bundle to a caller-selected path, or use complete CLI JSON output. The connection remains usable.";
+
+/** Next step when one MCP frame cannot carry a complete retained session bundle. */
+export const MCP_TRANSPORT_EVIDENCE_DISCOVERY = `Discover retained records with get_evidence_bundle and detail: summary, then inspect compatible records through inspect_analysis_view using an exact Evidence reference. ${MCP_TRANSPORT_EVIDENCE_EXPORT}`;
 
 export const analysisErrorRemediationAction = (
   error: AnalysisError,
@@ -50,6 +58,11 @@ export const analysisErrorRemediationAction = (
     return error.remediationAction;
   if (
     error instanceof BrowserObservationError &&
+    error.remediationAction !== undefined
+  )
+    return error.remediationAction;
+  if (
+    error instanceof BrowserObservationError &&
     error.reason === "service_worker_blocked"
   )
     return "Set environment.service_workers to allow to permit this capture, or remove the service worker registration through the browser. REA never removes existing registrations.";
@@ -57,6 +70,11 @@ export const analysisErrorRemediationAction = (
     return "Review details.reason, then retry the same analysis after the condition clears.";
   if (error instanceof EvidenceFileError && error.published !== undefined)
     return "Use the published file at details.published_path and resolve the reported staging cleanup failure.";
+  if (
+    error instanceof ProviderSelectionError &&
+    error.remediationAction !== undefined
+  )
+    return error.remediationAction;
   if (error instanceof AnalysisSnapshotMismatchError)
     return "Run analysis without this snapshot, then save a fresh snapshot using the intended artifact, provider, and analysis profile.";
   if (error instanceof AnalysisUnsupportedTargetError)
@@ -67,21 +85,27 @@ export const analysisErrorRemediationAction = (
   if (error instanceof AnalysisResourceConstraintError)
     return (
       error.remediationAction ??
-      (error.resource === "capacity"
-        ? "Wait for an active analysis to complete, then retry within the reported admission limits."
-        : error.resource === "transport"
-          ? "Discover retained records with get_evidence_bundle and detail: summary, then inspect compatible records through inspect_analysis_view using an exact Evidence reference. Export complete retained session evidence through export_evidence_bundle to a caller-selected path, or use complete CLI JSON output. The connection remains usable."
-          : error.resource === "cpu"
-            ? "Review the reported worker CPU limits and observed signal. Retry with sufficient CPU time or a smaller artifact; REA retains tighter inherited limits."
-            : error.resource === "file-size"
-              ? "Review the reported worker file-size limits and write failure. Retry with a sufficient file-size allowance for the evidence reply; REA retains tighter inherited limits."
-              : "Review the reported worker memory limits and available host memory. Retry with sufficient memory or a smaller artifact; REA retains tighter inherited limits.")
+      (error.fixedAllowance !== undefined
+        ? fixedAllowanceRemediation(
+            error.fixedAllowance.name,
+            error.fixedAllowance.kind,
+          )
+        : error.resource === "capacity"
+          ? "Wait for an active analysis to complete, then retry within the reported admission limits."
+          : error.resource === "transport"
+            ? MCP_TRANSPORT_EVIDENCE_DISCOVERY
+            : error.resource === "cpu"
+              ? "Review the reported worker CPU limits and observed signal. Retry with sufficient CPU time or a smaller artifact; REA retains tighter inherited limits."
+              : error.resource === "file-size"
+                ? "Review the reported worker file-size limits and write failure. Retry with a sufficient file-size allowance for the evidence reply; REA retains tighter inherited limits."
+                : "Review the reported worker memory limits and available host memory. Retry with sufficient memory or a smaller artifact; REA retains tighter inherited limits.")
     );
   if (
     error instanceof AnalysisTimeoutError &&
     error.remediationAction !== undefined
   )
     return error.remediationAction;
+  if (error instanceof AnalysisTimeoutError) return timeoutRemediation(error);
   if (error instanceof HopperTimeoutError)
     return error.operation === undefined
       ? "Review details.launcher and inspect Hopper for ongoing initial analysis or a pending loader, demo, or license dialog. For a large target, increase REA_HOPPER_STARTUP_TIMEOUT_MS in the environment that starts REA and allow at least that long in the MCP client. Resolve retained cleanup before reopening."
@@ -99,7 +123,7 @@ export const analysisErrorRemediationAction = (
       ? "Correct the reported address, document, or arguments and retry."
       : "Review the Hopper diagnostic details and correct the request or target; run `rea doctor` if the provider itself is failing. Repeating the unchanged request is not expected to succeed.";
   if (error instanceof EvidenceReferenceError)
-    return "Use an exact Evidence reference retained by this session, supply the complete inline Evidence, re-run its producer, or import its Evidence bundle. close_binary clears retained records.";
+    return "Use an exact Evidence reference available from the selected source, supply the complete inline Evidence, re-run its producer, or select/import its Evidence bundle. close_binary clears a server session's retained records.";
   if (
     error instanceof BinaryTargetError &&
     error.constraint === "directory_requires_file"
@@ -130,7 +154,7 @@ export const analysisErrorRemediationAction = (
   if (error instanceof ConfigurationError && error.settings.length > 0)
     return `Correct ${[...new Set(error.settings.map(({ setting }) => setting))].join(", ")} in the environment that starts REA (your shell or the MCP client's registration), then rerun.`;
   if (error instanceof AnalysisInputError)
-    return "Correct the listed arguments and retry.";
+    return `Read the declared input schema or CLI usage for ${error.operation}; if using MCP and the catalog may be stale, call tools/list. Correct the listed fields, then retry. Do not repeat the unchanged call.`;
   if (
     error instanceof AnalysisOutputError &&
     error.remediationAction !== undefined
@@ -203,6 +227,7 @@ const browserErrorCategory = (
     reason === "target_not_allowed" ||
     reason === "service_worker_blocked" ||
     reason === "target_changed" ||
+    reason === "target_session_detached" ||
     reason === "endpoint_unreachable" ||
     reason === "disconnected"
   )
@@ -254,6 +279,8 @@ export const analysisErrorUserMessage = (error: AnalysisError): string => {
       error.userMessage ??
       "Analysis input is invalid. Check the arguments and try again."
     );
+  if (error instanceof AnalysisTimeoutError)
+    return error.userMessage ?? timeoutUserMessage(error);
   const hopperMessage = hopperErrorUserMessage(error);
   if (hopperMessage !== undefined) return hopperMessage;
   if (error.userMessage !== undefined) return error.userMessage;
@@ -264,7 +291,7 @@ export const analysisErrorUserMessage = (error: AnalysisError): string => {
   if (error instanceof ArtifactOperationError) return artifactMessage(error);
   if (error instanceof EvidenceReferenceError)
     return error.reason === "missing"
-      ? `Evidence ${error.evidenceId} is not retained in this session. Supply complete inline Evidence, re-run its producer, or import its bundle before using this reference.`
+      ? `Evidence ${error.evidenceId} is not available from the selected source. Supply complete inline Evidence, re-run its producer, or select/import its bundle before using this reference.`
       : `Evidence ${error.evidenceId} does not match the requested reference (${error.reason}). Check the expected and actual identity in the diagnostic details.`;
   if (error instanceof EvidenceIntegrityError)
     return "Evidence is invalid or has changed. Recreate or re-import it, then try again.";
@@ -383,6 +410,12 @@ const standardErrorMessage = (tag: AnalysisErrorTag): string | undefined => {
   return undefined;
 };
 
+const timeoutUserMessage = (error: AnalysisTimeoutError): string =>
+  `REA's ${error.operation} operation reached its ${String(error.timeoutMs)}ms server/provider deadline. This is not a client-side timeout; extending only the MCP client's deadline does not change this budget.`;
+
+const timeoutRemediation = (error: AnalysisTimeoutError): string =>
+  `Inspect any partial Evidence, provider diagnostics and reported session/provider cleanup state for ${error.operation}. Reduce the request if supported, or resolve the reported provider condition before retrying. Do not repeat the unchanged call or retry while work or cleanup may still be active.`;
+
 const UNREADABLE_OUTPUT_TAGS: ReadonlySet<AnalysisErrorTag> = new Set([
   "AnalysisProtocolError",
   "AnalysisOutputError",
@@ -440,7 +473,9 @@ const artifactMessage = ({
     return "Artifact processing is unavailable for the current target or host. Check artifact support and required tools.";
   if (reason === "integrity" && INTEGRITY_POLICY_OPERATIONS.has(operation))
     return `${
-      details?.unpacked === true && details.calculatedSha256 !== null
+      details?.unpacked === true &&
+      "calculatedSha256" in details &&
+      details.calculatedSha256 !== null
         ? `Declared ASAR integrity for unpacked entry ${details.logicalPath} contradicts its companion file; packaging tools commonly sign or strip unpacked native binaries after writing the archive.`
         : "Artifact bytes contradict declared integrity."
     } If expected, rerun ${operation === "inventory_artifact" ? "inspect_artifact" : operation} with integrity_policy=record-and-continue (CLI: --integrity-policy record-and-continue) to retain observed bytes as untrusted; otherwise get a fresh copy.`;

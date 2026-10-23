@@ -1,5 +1,10 @@
 import { z } from "zod";
 import {
+  bundleResourceRootSchema,
+  bundleResourceBoundResultSchema,
+  type BundleResourceRoot,
+} from "./bundleResourceRoot.js";
+import {
   createPlistNumberProjection,
   type PlistNumberLiterals,
 } from "./plistNumbers.js";
@@ -21,18 +26,20 @@ export const interfaceBuilderDocumentSchema = z.strictObject({
   relative_path: z.string().min(1),
   archive_sha256: z.string().regex(/^[a-f0-9]{64}$/u),
   document_kind: z.enum(["nib", "storyboard_scene"]),
-  object_count: z.number().int().nonnegative(),
-  connection_count: z.number().int().nonnegative(),
+  object_count: z.int().nonnegative(),
+  connection_count: z.int().nonnegative(),
   hierarchy_complete: z.boolean(),
 });
 
 /** Normalized read-only Interface Builder graph with archive provenance. */
-export const interfaceBuilderAnalysisSchema = z.strictObject({
-  target_sha256: z.string().regex(/^[a-f0-9]{64}$/u),
-  documents: z.array(interfaceBuilderDocumentSchema).max(64),
-  graph: nativeInvestigationGraphSchema,
-  limitations: z.array(z.string()),
-});
+export const interfaceBuilderAnalysisSchema = bundleResourceBoundResultSchema(
+  z.string().regex(/^[a-f0-9]{64}$/u),
+  {
+    documents: z.array(interfaceBuilderDocumentSchema).max(64),
+    graph: nativeInvestigationGraphSchema,
+    limitations: z.array(z.string()),
+  },
+);
 
 export interface InterfaceBuilderDocumentInput {
   readonly relativePath: string;
@@ -50,7 +57,8 @@ type InvestigationEdge = z.infer<typeof nativeInvestigationEdgeSchema>;
 
 /** Build the graph returned by the static Interface Builder archive decoder. */
 export const buildInterfaceBuilderAnalysis = (input: {
-  readonly targetSha256: string;
+  readonly targetSha256: string | null;
+  readonly resourceRoot?: BundleResourceRoot;
   readonly toolVersion: string;
   readonly documents: readonly InterfaceBuilderDocumentInput[];
   readonly limits: z.output<typeof interfaceBuilderLimitsSchema>;
@@ -453,6 +461,9 @@ export const buildInterfaceBuilderAnalysis = (input: {
     // no connection record, so its coverage is partial with its own reason
     // rather than absent or truncated.
     const connectionsUnresolved = parsed.unresolvedConnections > 0;
+    const unsupportedConnections = parsed.connections.some(
+      ({ kind }) => kind === "other",
+    );
     omittedObjects +=
       parsed.omittedObjects +
       Math.max(0, parsed.objects.length - documentObjectCount);
@@ -500,7 +511,8 @@ export const buildInterfaceBuilderAnalysis = (input: {
         status:
           connectionsTruncated ||
           documentOmittedConnections > 0 ||
-          connectionsUnresolved
+          connectionsUnresolved ||
+          unsupportedConnections
             ? "partial"
             : "complete",
         reason:
@@ -508,7 +520,9 @@ export const buildInterfaceBuilderAnalysis = (input: {
             ? "connection_limit_reached"
             : connectionsUnresolved
               ? "connection_unresolved"
-              : null,
+              : unsupportedConnections
+                ? "unsupported_connection_type"
+                : null,
         examined: Math.min(
           parsed.connections.length,
           input.limits.max_connections,
@@ -575,6 +589,9 @@ export const buildInterfaceBuilderAnalysis = (input: {
     });
   return interfaceBuilderAnalysisSchema.parse({
     target_sha256: input.targetSha256,
+    ...(input.resourceRoot === undefined
+      ? {}
+      : { resource_root: input.resourceRoot }),
     documents: summaries,
     graph: {
       target_sha256: input.targetSha256,
@@ -603,9 +620,9 @@ export const buildInterfaceBuilderAnalysis = (input: {
 
 /** Hard limits shared by Interface Builder archive aggregation and tracing. */
 export const interfaceBuilderLimitsSchema = z.strictObject({
-  max_documents: z.number().int().min(1).max(64).default(64),
-  max_objects: z.number().int().min(1).max(20_000).default(20_000),
-  max_connections: z.number().int().min(1).max(40_000).default(40_000),
+  max_documents: z.int().min(1).max(64).default(64),
+  max_objects: z.int().min(1).max(20_000).default(20_000),
+  max_connections: z.int().min(1).max(40_000).default(40_000),
   trace: nativeInvestigationTraceLimitsSchema.default({
     max_depth: 8,
     max_nodes: 250,

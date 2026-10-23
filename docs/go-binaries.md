@@ -19,6 +19,56 @@ requires an absolute filesystem path and preserves that exact selection:
 }
 ```
 
+For build identity and counts, select `detail: "summary"`. MCP retains the same
+complete Evidence and returns `normalized_result.parent_evidence_id`. Read
+selected dependency versions without reopening the file:
+
+```json
+{
+  "name": "inspect_analysis_view",
+  "arguments": {
+    "source": {
+      "kind": "retained-evidence",
+      "evidence_id": "ev_<parent digest>"
+    },
+    "view": {
+      "kind": "go",
+      "collection": "dependencies",
+      "paths": ["golang.org/x/crypto"],
+      "fields": ["path", "version", "replacement"],
+      "offset": 0,
+      "limit": 10
+    }
+  }
+}
+```
+
+Go views support `dependencies` (exact `paths`) and `settings` (exact `keys`),
+optional original `indices`, field selection, and pagination. Filters intersect;
+empty filter arrays select no rows and `fields: []` returns only row identity.
+Each row keeps its original `index`, scoped to the parent Evidence and collection;
+duplicate module paths and setting keys keep distinct indices. Page offsets
+count matching records. Exhausting retained rows does not establish complete
+runtime dependencies. Original bytes, unknown lines and all complete metadata
+remain in the parent and can be exported as an Evidence bundle.
+
+One-shot CLI summaries save complete Evidence before returning the projection:
+
+```bash
+rea inspect-go-binary ./application --detail summary --evidence_output ./go-evidence.json --json
+```
+
+`--evidence_output` is required for CLI summary delivery and never overwrites an
+existing file. The default CLI/MCP reply remains complete.
+
+[Measured workflows](https://github.com/morluto/rea/blob/42e1a17d6e6c0487f17be0bae248553c4caba7f7/experiments/analysis-efficiency/go-build-views.md) include
+catalog repetition and extra calls. Identity/count questions benefit from a
+single summary. In the tested Codex full-catalog configuration, a compound
+question about identity and one dependency uses fewer tokens in captured request JSON with
+one complete inspection than with a summary followed by a lookup. The complete
+reply remains useful for that initial question; retained views support later
+selected reads. Token figures are serialization estimates, not model usage.
+
 ## Observations
 
 The inline Evidence result contains the artifact path, SHA-256, byte length,
@@ -59,17 +109,34 @@ module record and no dependency records has an observed empty dependency list.
 
 ## Supported boundary
 
-The built-in TypeScript reader supports ELF, PE and thin Mach-O images with Go's
-inline or historical pointer build-info encoding. Source ranges refer to the
-original stable file snapshot, including pointer-backed strings. It does not
-scan arbitrary byte strings as compiler metadata or interpret a fat Mach-O
-container as one selected architecture.
+The built-in TypeScript reader supports ELF, PE and thin Mach-O images, and one
+selected slice of a universal Mach-O, with Go's inline or historical pointer
+build-info encoding. Source ranges refer to the original stable file snapshot,
+including pointer-backed strings. Legacy pointer-backed fields are decoded at
+the width declared by Go's build-info record, independently of the image's ELF
+class. It does not scan arbitrary byte strings as compiler metadata.
+
+A universal (FAT) Mach-O needs `architecture` (`x86`, `x86_64`, `arm`
+or `arm64`; CLI `--architecture`). REA reads its own FAT table, without `lipo`,
+and validates the selected slice's range, alignment and Mach-O header CPU
+against the table. The result keeps the universal file as `artifact` (its
+SHA-256 and size), adds `selected_slice` with the slice offset, length, raw CPU
+type/subtype and the FAT table digest, and reports every source range as a
+file offset inside that slice. Without `architecture`, or when the file has no
+such slice or several, the request fails on `architecture` and lists the slices
+present. `architecture` on any other image is rejected rather than ignored.
 
 For ELF images without a named build-info section, discovery checks each
 nonempty writable, non-executable load segment in program-header order. This
 includes sectionless PIE images with metadata in a later data segment. Named
 sections retain priority, and alignment, file mapping and record validation
-remain required.
+remain required. When ELF section names are unreadable, limitations report that
+coverage gap; the fallback search policy is unchanged.
+
+A named ELF build-info section selects the record's discovery range. For inline
+encoding, the following version and module strings may continue past that
+section into its file-backed load mapping; their bytes are still checked
+against the mapping and the existing aggregate string limit.
 
 Historical moduleless Go binaries can store their empty module-string header in
 declared zero-initialized virtual memory rather than file-backed bytes. The reader

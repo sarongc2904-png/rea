@@ -14,6 +14,7 @@ import {
   AnalysisInputError,
   AnalysisTimeoutError,
   AnalysisResourceConstraintError,
+  resourceConstraintRecovery,
 } from "../domain/analysisErrorCore.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
@@ -150,6 +151,29 @@ class IdaCleanupError extends ProviderAdapterError {
     this.setCleanupResources([path]);
   }
 }
+
+/**
+ * A worker that is still tearing down can remain in inventory with its identity
+ * already cleared: an empty `session_id`, `owned: false` and `is_active: false`,
+ * while `input_path` still names the private copy. Such a row establishes no
+ * live session, so the private-input arm must not report it as a blocker. The
+ * owning worker is matched by its own session ID separately, and a genuine peer
+ * on the same input keeps a session ID, so neither case is weakened.
+ *
+ * Limited to `backend: "worker"`: a gui row belongs to an IDA instance REA does
+ * not control, and the observed teardown shape covers workers only, so a gui
+ * row keeps blocking release whatever its flags say.
+ */
+const isReleasedWorkerRow = (entry: {
+  readonly session_id: string;
+  readonly owned: boolean;
+  readonly is_active: boolean;
+  readonly backend: "worker" | "gui";
+}): boolean =>
+  entry.backend === "worker" &&
+  entry.session_id === "" &&
+  entry.owned === false &&
+  entry.is_active === false;
 
 /** Serial read-only session whose lifecycle authority excludes an attached GUI. */
 export class IdaSessionClient implements AnalysisClient {
@@ -499,6 +523,9 @@ export class IdaSessionClient implements AnalysisClient {
             { kind: "artifact-path", path: this.target.path },
             ...runner.locations,
           ],
+          ...(this.profile === undefined
+            ? {}
+            : { analysisProfile: this.profile }),
         }),
       );
     }
@@ -530,33 +557,35 @@ export class IdaSessionClient implements AnalysisClient {
         ...(cause.userMessage === undefined
           ? {}
           : { userMessage: cause.userMessage }),
-        ...(cause.remediationAction === undefined
-          ? {}
-          : { remediationAction: cause.remediationAction }),
         diagnostics: {
           ...cause.diagnostics,
           startup_operation: cause.operation,
         },
       };
+      const action =
+        cause.remediationAction === undefined
+          ? {}
+          : { remediationAction: cause.remediationAction };
       // Startup is shared, but each accepted operation owns its attribution.
       // Keep the original cached failure unchanged for later callers.
       const failure =
         cause instanceof AnalysisTimeoutError
-          ? new AnalysisTimeoutError(operation, cause.timeoutMs, options)
+          ? new AnalysisTimeoutError(operation, cause.timeoutMs, {
+              ...options,
+              ...action,
+            })
           : cause instanceof AnalysisResourceConstraintError
             ? new AnalysisResourceConstraintError(
                 operation,
                 cause.resource,
                 cause.reason,
                 cause.reportedLimits,
-                {
-                  ...options,
-                  ...(cause.retryable === undefined
-                    ? {}
-                    : { retryable: cause.retryable }),
-                },
+                { ...options, ...resourceConstraintRecovery(cause) },
               )
-            : new ProviderAdapterError(cause.providerId, operation, options);
+            : new ProviderAdapterError(cause.providerId, operation, {
+                ...options,
+                ...action,
+              });
       throw failure
         .bindCleanupDependencies([cause])
         .bindCleanupResourceOwner(cause);
@@ -867,11 +896,12 @@ export class IdaSessionClient implements AnalysisClient {
           );
           const remaining = inventory.sessions.filter(
             (entry) =>
-              entry.session_id === this.#database ||
-              sameIdaHostPath(
-                entry.input_path,
-                this.#workspace?.inputPath ?? "",
-              ),
+              !isReleasedWorkerRow(entry) &&
+              (entry.session_id === this.#database ||
+                sameIdaHostPath(
+                  entry.input_path,
+                  this.#workspace?.inputPath ?? "",
+                )),
           );
           if (this.#recordBlockingSessions(remaining))
             throw new AnalysisProtocolError(

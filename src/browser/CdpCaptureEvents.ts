@@ -29,6 +29,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
   readonly network = new Map<string, NetworkState>();
   readonly networkRequestTimestamps = new Map<string, number>();
   readonly malformedRedirectRequestIds = new Set<string>();
+  readonly missingRequestBodyShapeIds = new Set<string>();
   readonly webSocketConnectionsById = new Map<
     string,
     WebPageInspection["network"]["websocket_connections"][number]
@@ -45,6 +46,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
   ]);
   originViolation = false;
   navigationDuringCapture = false;
+  unknownRootIdentity = false;
   mainFrameId: string | undefined = undefined;
   committedDocument: string | undefined = undefined;
 
@@ -60,6 +62,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
     this.mainFrameId = frameId;
     this.originViolation = false;
     this.navigationDuringCapture = false;
+    this.unknownRootIdentity = false;
     this.committedDocument = undefined;
     this.scripts.clear();
     this.scriptMetadataBudgetOmissionsById.clear();
@@ -74,6 +77,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
     this.#networkRequestOccurrences.clear();
     this.#responseBodyExaminedOccurrences.clear();
     this.malformedRedirectRequestIds.clear();
+    this.missingRequestBodyShapeIds.clear();
     this.webSocketConnectionsById.clear();
     this.console.length = 0;
     this.responseMetadata.length = 0;
@@ -122,6 +126,10 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
   }
 
   ingest(event: CdpEvent): void {
+    if (event.method === "Page.frameNavigated") {
+      handlers.handleFrameNavigated(this, event.params);
+      return;
+    }
     const params = recordValue(event.params);
     if (params === undefined) return;
     switch (event.method) {
@@ -157,9 +165,6 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
         break;
       case "Runtime.consoleAPICalled":
         handlers.handleConsoleAPICalled(this, params);
-        break;
-      case "Page.frameNavigated":
-        handlers.handleFrameNavigated(this, params);
         break;
       case "Network.webSocketCreated":
         handlers.handleWebSocketCreated(this, params);

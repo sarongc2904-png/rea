@@ -16,6 +16,7 @@ import {
   systemUpdateHost,
 } from "../../src/application/UpdateRuntime.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
+import { cliTest } from "../support/cli/cliFixture.js";
 
 const entryPoint = resolve("scripts/rea.mjs");
 let home: string;
@@ -129,6 +130,28 @@ describe("OMP integration maintenance", () => {
 });
 
 describe("maintenance activation and layered configuration", () => {
+  it("leaves an inherited disabled OpenCode V2 registration outside maintenance", async () => {
+    const upper = await writeClient(
+      "opencode",
+      JSON.stringify({ mcp: { servers: {} }, theme: "user-selected" }),
+    );
+    const lower = join(home, ".config", "opencode", "config.json");
+    const originalLower = JSON.stringify({
+      mcp: {
+        servers: {
+          rea: { type: "local", command: [entryPoint, "mcp"], disabled: true },
+        },
+      },
+    });
+    await writeFile(lower, originalLower);
+    const originalUpper = await readFile(upper, "utf8");
+    await expect(
+      existingMaintenanceScope(home, entryPoint, process.env),
+    ).resolves.toMatchObject({ clients: [] });
+    expect(await readFile(lower, "utf8")).toBe(originalLower);
+    expect(await readFile(upper, "utf8")).toBe(originalUpper);
+  });
+
   it("leaves a natively disabled ZCode registration outside maintenance", async () => {
     const configPath = await writeClient(
       "zcode",
@@ -381,21 +404,23 @@ describe("updated executable maintenance planning", () => {
 });
 
 describe("update subprocess boundaries", () => {
-  it("exposes update as the sole CLI command", async () => {
-    const help = await runUpdateCommand(
-      [process.execPath, entryPoint, "--help"],
-      process.env,
-    );
-    expect(help.ok).toBe(true);
-    if (help.ok) {
-      expect(help.value).toMatch(/^\s{2}update\s/mu);
-      expect(help.value).not.toMatch(/^\s{2}upgrade\s/mu);
-    }
-    const removed = await runUpdateCommand(
-      [process.execPath, entryPoint, "upgrade", "--json"],
-      process.env,
-    );
-    expect(removed.ok).toBe(false);
+  cliTest("exposes update in CLI help", async ({ cli }) => {
+    const help = await cli.run({
+      arguments: ["--help"],
+      environment: process.env,
+    });
+    expect(help.exitCode, help.stderr).toBe(0);
+    expect(help.stdout).toMatch(/^\s{2}update\s/mu);
+    expect(help.stdout).not.toMatch(/^\s{2}upgrade\s/mu);
+  });
+
+  cliTest("rejects the removed upgrade CLI command", async ({ cli }) => {
+    const removed = await cli.run({
+      arguments: ["upgrade", "--json"],
+      environment: process.env,
+    });
+    expect(removed.exitCode, removed.stderr).toBe(1);
+    expect(removed.json).toMatchObject({ code: "COMMAND_NOT_FOUND" });
   });
   it("captures output through stream closure and keeps arguments literal", async () => {
     const literal = 'space and $(echo bad); & | "quotes"';

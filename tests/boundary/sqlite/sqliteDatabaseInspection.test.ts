@@ -235,6 +235,53 @@ it("counts schema names once when enforcing the complete reply budget", async ()
   );
 });
 
+it("keeps unrelated catalog names outside the selected-table reply budget", async () => {
+  const path = await createDatabase(
+    "CREATE TABLE selected(value TEXT); INSERT INTO selected VALUES ('retained');",
+  );
+  const producer = new DatabaseSync(path);
+  try {
+    producer.exec("BEGIN");
+    for (let index = 0; index < 60; index++) {
+      const name = `unrelated_${index}_${"x".repeat(300 * 1024)}`;
+      producer.exec(`CREATE TABLE "${name}" (value TEXT)`);
+    }
+    producer.exec("COMMIT");
+  } finally {
+    producer.close();
+  }
+  const selected = inspectSqliteDatabaseSnapshot(path, {
+    path,
+    table: "selected",
+  });
+  expect(selected.schema).toMatchObject({
+    scope: "selected_table",
+    completeness: "complete",
+    tables: [{ name: "selected" }],
+    indexes: [],
+    views: [],
+    triggers: [],
+  });
+  expect(selected.schema.tables).toHaveLength(1);
+  expect(selected.rows).toMatchObject({
+    returned_rows: 1,
+    values: [[{ type: "text", value: "retained" }]],
+  });
+  expect(() =>
+    inspectSqliteDatabaseSnapshot(path, { path, table: "absent" }),
+  ).toThrowError(
+    expect.objectContaining({
+      reason: "selection",
+      message:
+        "Selected ordinary table does not exist with that exact name: absent",
+    }),
+  );
+  for (const schema_scope of ["inventory", "database"] as const)
+    expect(() =>
+      inspectSqliteDatabaseSnapshot(path, { path, schema_scope }),
+    ).toThrowError(expect.objectContaining({ reason: "output-limit" }));
+});
+
 it("rejects malformed schema bytes instead of returning replacement text", async () => {
   const path = await createDatabase(
     "CREATE TABLE records(value TEXT /*schema-marker*/)",
@@ -364,6 +411,179 @@ it("rejects the combined representation of individually small generated cells", 
   }
 });
 
+it("attributes compile and row evaluation errors to each failing generated column", async () => {
+  const workspace = await createTestWorkspace("rea-sqlite-evaluation-");
+  onTestFinished(() => removeTestWorkspace(workspace.root));
+  const path = workspace.path("private.db");
+  // Writable schema plants an expression that fails only for the second
+  // stored row; virtual cells are not stored, so record layout is unchanged.
+  const producer = new DatabaseSync(path, { defensive: false });
+  try {
+    producer.function("application_digest", { deterministic: true }, (value) =>
+      String(value),
+    );
+    producer.exec(`
+      CREATE TABLE t(
+        id INTEGER,
+        payload TEXT,
+        digest TEXT GENERATED ALWAYS AS (application_digest(payload)) VIRTUAL,
+        stored_digest TEXT GENERATED ALWAYS AS (application_digest(payload)) STORED,
+        field GENERATED ALWAYS AS (payload) VIRTUAL,
+        upper_payload GENERATED ALWAYS AS (upper(payload)) VIRTUAL
+      );
+      INSERT INTO t(id, payload) VALUES (1, '{"k":1}'), (2, 'not json');
+      PRAGMA writable_schema = ON;
+      UPDATE sqlite_schema
+        SET sql = replace(sql, 'field GENERATED ALWAYS AS (payload)', 'field GENERATED ALWAYS AS (json_extract(payload, ''$.k''))')
+        WHERE name = 't';
+      PRAGMA writable_schema = OFF;
+    `);
+  } finally {
+    producer.close();
+  }
+  const failure = (input: { columns?: string[]; row_limit?: number }) => {
+    try {
+      inspectSqliteDatabaseSnapshot(path, { path, table: "t", ...input });
+    } catch (cause: unknown) {
+      return cause;
+    }
+    throw new Error("Expected a generated-column evaluation failure");
+  };
+  const prefix = `SQLite cannot evaluate selected column(s) of table "t" on REA's read-only connection: `;
+  expect(failure({})).toMatchObject({
+    reason: "column-evaluation",
+    message: `${prefix}"digest": unknown function: application_digest(); "field": malformed JSON`,
+    readableColumns: ["id", "payload", "stored_digest", "upper_payload"],
+  });
+  expect(failure({ columns: ["field", "id", "field"] })).toMatchObject({
+    message: `${prefix}"field": malformed JSON`,
+    readableColumns: ["id"],
+  });
+  // With no readable selection left, stored columns remain available without evaluation.
+  expect(failure({ columns: ["digest"] })).toMatchObject({
+    message: `${prefix}"digest": unknown function: application_digest()`,
+    readableColumns: ["id", "payload", "stored_digest"],
+  });
+  // Only sampled rows are evaluated, and stored or built-in generated cells are read.
+  expect(
+    inspectSqliteDatabaseSnapshot(path, {
+      path,
+      table: "t",
+      columns: ["field", "stored_digest", "upper_payload"],
+      row_limit: 1,
+    }).rows,
+  ).toMatchObject({
+    values: [
+      [
+        { type: "integer", value: "1" },
+        { type: "text", value: '{"k":1}' },
+        { type: "text", value: '{"K":1}' },
+      ],
+    ],
+    truncated: true,
+  });
+});
+
+const createApplicationDatabase = async (
+  sql: string,
+  edit?: (bytes: Buffer) => void,
+): Promise<string> => {
+  const workspace = await createTestWorkspace("rea-sqlite-evaluation-");
+  onTestFinished(() => removeTestWorkspace(workspace.root));
+  const path = workspace.path("private.db");
+  const producer = new DatabaseSync(path);
+  try {
+    // The producing application supplies a function REA's connection lacks.
+    producer.function("application_digest", { deterministic: true }, (value) =>
+      String(value),
+    );
+    producer.exec(sql);
+  } finally {
+    producer.close();
+  }
+  if (edit !== undefined) {
+    const bytes = await readFile(path);
+    edit(bytes);
+    await writeFile(path, bytes);
+  }
+  return path;
+};
+
+it("never recommends a selected column whose own probe fails for another reason", async () => {
+  const path = await createApplicationDatabase(`
+    CREATE TABLE t(
+      id INTEGER,
+      digest TEXT GENERATED ALWAYS AS (application_digest(id)) VIRTUAL,
+      payload BLOB GENERATED ALWAYS AS (zeroblob(72 * 1024 * 1024)) VIRTUAL
+    );
+    INSERT INTO t(id) VALUES (1);
+  `);
+  expect(() =>
+    inspectSqliteDatabaseSnapshot(path, {
+      path,
+      table: "t",
+      columns: ["payload", "digest", "id"],
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      reason: "column-evaluation",
+      message: `SQLite cannot evaluate selected column(s) of table "t" on REA's read-only connection: "payload": string or blob too big; "digest": unknown function: application_digest()`,
+      readableColumns: ["id"],
+    }),
+  );
+});
+
+it("recommends stored columns outside an inventory-scope selection without decoding malformed names", async () => {
+  const path = await createApplicationDatabase(
+    `
+    CREATE TABLE t(
+      id INTEGER,
+      "col" TEXT,
+      payload TEXT,
+      digest TEXT GENERATED ALWAYS AS (application_digest(payload)) VIRTUAL
+    );
+    INSERT INTO t(id, "col", payload) VALUES (1, 'kept', 'value');
+  `,
+    (bytes) => {
+      const marker = Buffer.from('"col"');
+      const offset = bytes.indexOf(marker);
+      if (offset < 0 || bytes.indexOf(marker, offset + 1) !== -1)
+        throw new Error("Expected unique authored column marker");
+      bytes[offset + 1] = 0xff;
+    },
+  );
+  expect(() =>
+    inspectSqliteDatabaseSnapshot(path, {
+      path,
+      table: "t",
+      schema_scope: "inventory",
+      columns: ["digest"],
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      reason: "column-evaluation",
+      message: `SQLite cannot evaluate selected column(s) of table "t" on REA's read-only connection: "digest": unknown function: application_digest()`,
+      readableColumns: ["id", "payload"],
+    }),
+  );
+  // The recommended stored columns are themselves selectable in the same scope.
+  expect(
+    inspectSqliteDatabaseSnapshot(path, {
+      path,
+      table: "t",
+      schema_scope: "inventory",
+      columns: ["id", "payload"],
+    }).rows,
+  ).toMatchObject({
+    values: [
+      [
+        { type: "integer", value: "1" },
+        { type: "text", value: "value" },
+      ],
+    ],
+  });
+});
+
 it("samples above 1000 rows and safe integer limits within the byte budget", async () => {
   const path = await createDatabase(`CREATE TABLE items(value INTEGER);
     WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers WHERE value < 1002)
@@ -391,3 +611,42 @@ nativeTest.skipIf(SQLITE_NATIVE_LIMITS_AVAILABLE)(
     ).toThrow("DatabaseSync.limits");
   },
 );
+
+it("classifies SQLite's result-column capacity refusal without blaming the database", async () => {
+  const path = await createDatabase(
+    "CREATE TABLE records(email TEXT); INSERT INTO records VALUES ('sample');",
+  );
+  const reader = new DatabaseSync(path, { readOnly: true });
+  const engineColumnLimit = (() => {
+    try {
+      return reader.limits.column;
+    } finally {
+      reader.close();
+    }
+  })();
+  const columns = (count: number): string[] =>
+    Array.from({ length: count }, () => "email");
+  const atLimit = inspectSqliteDatabaseSnapshot(path, {
+    path,
+    table: "records",
+    columns: columns(engineColumnLimit),
+  });
+  expect(atLimit.rows).toMatchObject({
+    columns: columns(engineColumnLimit),
+    returned_rows: 1,
+  });
+  expect(() =>
+    inspectSqliteDatabaseSnapshot(path, {
+      path,
+      table: "records",
+      columns: columns(engineColumnLimit + 1),
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      reason: "column-limit",
+      selectedColumns: engineColumnLimit + 1,
+      engineColumnLimit,
+      message: expect.stringContaining("too many columns in result set"),
+    }),
+  );
+});

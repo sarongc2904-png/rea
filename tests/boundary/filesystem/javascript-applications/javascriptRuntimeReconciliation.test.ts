@@ -6,13 +6,14 @@ import { expect, it } from "vitest";
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
 
 import { createElectronActiveEvidence } from "../../../../src/application/javascript/ElectronActiveEvidence.js";
+import { javascriptApplicationAnalysisResultSchema } from "../../../../src/domain/javascript/javascriptApplicationAnalysis.js";
 import { reconcileJavaScriptRuntimeEvidence } from "../../../../src/application/javascript/JavaScriptRuntimeReconciliationService.js";
 import { createEvidence } from "../../../../src/domain/evidence.js";
 import { mappedRuntimePaths } from "../../../../src/domain/javascript/javascriptRuntimeStaticCandidates.js";
 import { projectRuntimeCaptures } from "../../../../src/domain/javascript/javascriptRuntimeReconciliationRuntime.js";
 import { electronPageInspectionSchema } from "../../../../src/domain/javascript/electronObservation.js";
 import {
-  parseRuntimeReconciliationInput,
+  readRuntimeReconciliationInput,
   reconcileJavaScriptRuntime,
 } from "../../../../src/domain/javascript/javascriptRuntimeReconciliation.js";
 import { reconcileJavaScriptRuntimeInputSchema } from "../../../../src/domain/javascript/javascriptRuntimeReconciliationSchemas.js";
@@ -27,12 +28,16 @@ import {
   electronRuntimeEvidence,
 } from "../../../fixtures/javascriptRuntimeReconciliation.js";
 
-const reconcileInput = (input: unknown) =>
-  reconcileJavaScriptRuntime(
-    parseRuntimeReconciliationInput(
-      reconcileJavaScriptRuntimeInputSchema.parse(input),
-    ),
+const readInput = (input: unknown) => {
+  const result = readRuntimeReconciliationInput(
+    reconcileJavaScriptRuntimeInputSchema.parse(input),
   );
+  if (!result.ok) throw result.error;
+  return result.value;
+};
+
+const reconcileInput = (input: unknown) =>
+  reconcileJavaScriptRuntime(readInput(input));
 
 it("preserves source-capture input paths for runtime Evidence", async () => {
   const root = await applicationFixture();
@@ -503,7 +508,7 @@ it.skipIf(process.platform === "win32")(
       "export const marker = 42;\n",
     );
     const analysis = await analyzeFixture(root);
-    const parsed = parseRuntimeReconciliationInput(
+    const parsed = readInput(
       reconcileJavaScriptRuntimeInputSchema.parse({
         static_layers: [
           {
@@ -727,6 +732,80 @@ it.skipIf(process.platform === "win32")(
     ).toMatchObject({ status: "unmatched" });
   },
 );
+
+it.each([false, true])(
+  "merges equivalent owned page declarations when target presence is %s",
+  async (present) => {
+    const root = await createTestTempDirectory("rea-generated-page-runtime-");
+    await mkdir(join(root, "app"), { recursive: true });
+    await writeFile(
+      join(root, "app", "package.json"),
+      JSON.stringify({ main: "main.cjs" }),
+    );
+    await writeFile(
+      join(root, "app", "main.cjs"),
+      'const {BrowserWindow} = require("electron"); const w = new BrowserWindow(); w.loadFile("generated.html"); w.loadFile("./generated.html");',
+    );
+    if (present)
+      await writeFile(join(root, "app", "generated.html"), "generated page");
+    const analysis = await analyzeFixture(root);
+    const { graph } = javascriptApplicationAnalysisResultSchema.parse(
+      analysis.normalized_result,
+    );
+    const roles = graph.nodes.filter(
+      ({ kind }) => kind === "electron-renderer",
+    );
+    expect(roles).toHaveLength(1);
+    expect(
+      roles[0]?.observations
+        .map(({ properties }) => properties.declared_path)
+        .sort(),
+    ).toEqual(["./generated.html", "generated.html"]);
+    const reconcileTarget = (path: string) =>
+      reconcileInput({
+        static_layers: [{ analysis, role: "application" }],
+        runtime_observations: [rendererCapture(root, path)],
+      }).reconciliations.find(({ entity_kind }) => entity_kind === "target");
+    expect(reconcileTarget(join(root, "app", "generated.html"))).toMatchObject({
+      status: "matched",
+      candidate_static_count: 1,
+    });
+    expect(reconcileTarget(join(root, "generated.html"))).toMatchObject({
+      status: "unmatched",
+    });
+  },
+);
+
+it("matches a resolved nested application path without an operator mapping", async () => {
+  const root = await createTestTempDirectory("rea-owned-loadfile-runtime-");
+  await mkdir(join(root, "app", "dist"), { recursive: true });
+  await mkdir(join(root, "dist"), { recursive: true });
+  await writeFile(
+    join(root, "app", "package.json"),
+    JSON.stringify({ main: "main.cjs" }),
+  );
+  await writeFile(
+    join(root, "app", "main.cjs"),
+    "const { BrowserWindow } = require('electron'); const win = new BrowserWindow(); win.loadFile('dist/index.html');",
+  );
+  await writeFile(
+    join(root, "app", "dist", "index.html"),
+    "application target",
+  );
+  await writeFile(join(root, "dist", "index.html"), "root decoy");
+  const analysis = await analyzeFixture(root);
+  const reconcileTarget = (path: string) =>
+    reconcileInput({
+      static_layers: [{ analysis, role: "application" }],
+      runtime_observations: [rendererCapture(root, path)],
+    }).reconciliations.find(({ entity_kind }) => entity_kind === "target");
+  expect(
+    reconcileTarget(join(root, "app", "dist", "index.html")),
+  ).toMatchObject({ status: "matched" });
+  expect(reconcileTarget(join(root, "dist", "index.html"))).toMatchObject({
+    status: "unmatched",
+  });
+});
 
 it("keeps a raw nested loadFile target application-relative when the producer also resolves a nested decoy", async () => {
   const root = await createTestTempDirectory("rea-raw-loadfile-ownership-");

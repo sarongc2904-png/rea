@@ -5,6 +5,10 @@ import { dirname, join } from "node:path";
 import { expect, onTestFinished, test, vi } from "vitest";
 
 import { PcapProvider } from "../../../src/pcap/PcapProvider.js";
+import {
+  CAPINFOS_COMMAND_ENV,
+  TSHARK_COMMAND_ENV,
+} from "../../../src/pcap/PcapConfiguration.js";
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
 import {
   pcapResultSchemas,
@@ -70,7 +74,10 @@ const TSHARK_JSON = JSON.stringify([
 
 const writeStubTools = async (
   root: string,
-  options: { readonly failCapinfos?: boolean } = {},
+  options: {
+    readonly failCapinfos?: boolean;
+    readonly httpAbsoluteUriOnly?: boolean;
+  } = {},
 ): Promise<{ tshark: string; capinfos: string }> => {
   const tshark = join(root, "tshark");
   const capinfos = join(root, "capinfos");
@@ -79,7 +86,8 @@ const writeStubTools = async (
     `#!/bin/sh
 if [ "$1" = "--version" ]; then printf 'TShark (Wireshark) 4.6.6-stub\\n'; exit 0; fi
 [ "$1" = "-n" ] && [ "$2" = "-r" ] && [ "$4" = "-T" ] && [ "$5" = "json" ] || exit 2
-printf '%s' '${TSHARK_JSON.replace(/'/gu, "'\\''")}'
+case " $* " in *" -e http.request.uri "*) ;; *) exit 2 ;; esac
+printf '%s' '${(options.httpAbsoluteUriOnly ? TSHARK_JSON.replace('"http.request.full_uri":["http://api.example.com/v1/data"]', '"http.request.uri":["http://proxy.example.test/path"]') : TSHARK_JSON).replace(/'/gu, "'\\''")}'
 exit 0
 `,
     { mode: 0o755 },
@@ -105,6 +113,7 @@ exit 0
 const providerWith = async (
   options: {
     failCapinfos?: boolean;
+    httpAbsoluteUriOnly?: boolean;
     launcher?: PcapCommandLauncher;
     beforeClose?: () => void;
   } = {},
@@ -141,7 +150,7 @@ const captureFixture = async (root: string): Promise<string> => {
 };
 
 it("inspects both tools without reading a capture", async () => {
-  const { provider } = await providerWith();
+  const { provider, root } = await providerWith();
   const result = await evidenceResult(provider, {
     operation: "inspect_pcap_client",
     input: {},
@@ -149,9 +158,48 @@ it("inspects both tools without reading a capture", async () => {
   expect(result.client).toMatchObject({
     tshark_source: "environment",
     tshark_version: "TShark (Wireshark) 4.6.6-stub",
+    tshark_sha256: createHash("sha256")
+      .update(await readFile(join(root, "tshark")))
+      .digest("hex"),
+    tshark_identity_status: "verified",
     capinfos_source: "environment",
     capinfos_version: "Capinfos (Wireshark) 4.6.6-stub",
+    capinfos_sha256: createHash("sha256")
+      .update(await readFile(join(root, "capinfos")))
+      .digest("hex"),
+    capinfos_identity_status: "verified",
   });
+});
+
+it("rejects a selected TShark whose bytes change during its version probe", async () => {
+  const root = await createTestTempDirectory("rea-pcap-tool-identity-");
+  const { tshark, capinfos } = await writeStubTools(root);
+  await writeFile(
+    tshark,
+    `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'TShark (Wireshark) 4.6.6-stub\\n'
+  printf '\\n# changed during version probe\\n' >> "$0"
+  exit 0
+fi
+exit 2
+`,
+    { mode: 0o755 },
+  );
+  const provider = new PcapProvider({
+    environment: { REA_TSHARK_COMMAND: tshark, REA_CAPINFOS_COMMAND: capinfos },
+  });
+  onTestFinished(() => provider.close());
+  const result = await provider.execute({
+    operation: "inspect_pcap_client",
+    input: {},
+  });
+  expect(result.ok).toBe(false);
+  if (!result.ok)
+    expect(projectAnalysisError(result.error)).toMatchObject({
+      code: "artifact_changed",
+      details: { path: tshark },
+    });
 });
 
 it("inspects a capture with endpoints, DNS, TLS SNI, and HTTP", async () => {
@@ -185,6 +233,17 @@ it("inspects a capture with endpoints, DNS, TLS SNI, and HTTP", async () => {
   ]);
   expect(result.tls_sni_values).toEqual(["api.example.com"]);
   expect(result.http_request_uris).toEqual(["http://api.example.com/v1/data"]);
+  expect(result.coverage).toBe("complete");
+});
+
+it("retains an absolute HTTP request target without a Host-derived full URI", async () => {
+  const { provider, root } = await providerWith({ httpAbsoluteUriOnly: true });
+  const path = await captureFixture(root);
+  const result = await evidenceResult(provider, {
+    operation: "inspect_pcap_capture",
+    input: { path },
+  });
+  expect(result.http_request_uris).toEqual(["http://proxy.example.test/path"]);
   expect(result.coverage).toBe("complete");
 });
 
@@ -380,10 +439,16 @@ it("reports relative configuration and missing capinfos as capability gaps", asy
     });
     if (result.ok) throw new Error("expected unavailable tools");
     const projected = projectAnalysisError(result.error);
-    expect(projected.code).toBe("capability_unavailable");
-    expect(projected.message).toContain(
-      "Supply Wireshark 4.x tshark and capinfos",
-    );
+    expect(projected).toMatchObject({
+      code: "capability_unavailable",
+      details: { provider_id: "pcap", operation: "inspect_pcap_client" },
+    });
+    expect(projected.message).toContain(TSHARK_COMMAND_ENV);
+    expect(projected.message).toContain(CAPINFOS_COMMAND_ENV);
+    expect(projected.message).toContain("Wireshark 4.x");
+    expect(projected.message).toContain("PATH");
+    expect(projected.message).toContain("absolute");
+    expect(projected.message).toContain("does not install");
   }
 });
 
@@ -404,10 +469,12 @@ it("names the prlimit selection when the Linux limiter is unusable", async () =>
   });
   if (result.ok) throw new Error("expected an unusable limiter");
   const projected = projectAnalysisError(result.error);
-  expect(projected.code).toBe("capability_unavailable");
-  expect(projected.message).toContain(
-    "(REA_TSHARK_PRLIMIT_COMMAND must be absolute.) Check that REA_TSHARK_PRLIMIT_COMMAND",
-  );
+  expect(projected).toMatchObject({
+    code: "capability_unavailable",
+    details: { provider_id: "pcap", operation: "inspect_pcap_capture" },
+  });
+  expect(projected.message).toContain("must be absolute");
+  expect(projected.message).toContain("Check that REA_TSHARK_PRLIMIT_COMMAND");
 });
 
 const nodeTool = async (

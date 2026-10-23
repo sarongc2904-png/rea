@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import type { FileCloseResourceOwner } from "../application/AnalysisProvider.js";
+import type { RetainedResourceScope } from "../application/AnalysisProvider.js";
 import {
-  ArtifactFileCancelled,
+  artifactFileCompletion,
   ArtifactFileCleanupFailure,
   artifactFilePrimaryFailure,
   withArtifactRegularFile,
@@ -15,7 +15,7 @@ import { ghidraFileFailure } from "./GhidraFileArtifacts.js";
 /** Metadata admission budget, not a Java Properties format limit. */
 export const MAX_GHIDRA_INSTALLATION_PROPERTIES_BYTES = 1024 * 1024;
 export interface GhidraInstallationFileOptions {
-  readonly resourceOwner: FileCloseResourceOwner;
+  readonly resourceOwner: RetainedResourceScope;
   readonly signal?: AbortSignal;
 }
 
@@ -64,13 +64,7 @@ export const readGhidraInstallationProperties = async (
       (physical.code === "ENOENT" || physical.code === "ENOTDIR")
     )
       return undefined;
-    const completed =
-      cause instanceof ArtifactFileCancelled
-        ? cause.fileCancellation.outcome.value
-        : cause instanceof ArtifactFileCleanupFailure &&
-            cause.fileCleanupFailure.outcome.kind === "completed"
-          ? cause.fileCleanupFailure.outcome.value
-          : undefined;
+    const completed = artifactFileCompletion(cause)?.value;
     const diagnostics = {
       path,
       stage: "installation_properties",

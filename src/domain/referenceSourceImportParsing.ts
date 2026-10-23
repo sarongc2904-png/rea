@@ -6,21 +6,23 @@ import type {
   StringLiteral,
 } from "@babel/types";
 import { traverseJavaScriptAst } from "./javascript/javascriptSemanticTraversal.js";
+import { readExactJavaScriptLiteral } from "./javascript/javascriptAstValues.js";
 import {
   parseRecoveredJavaScript,
   parserPluginsForPath,
 } from "./javascript/javascriptSourceParser.js";
-import { unshadowedReferenceSourceRequireCalls } from "./referenceSourceRequireBindings.js";
+import {
+  referenceSourceRequireCalls,
+  type ReferenceSourceRequireCall,
+} from "./referenceSourceRequireBindings.js";
 import { isRelativeJavaScriptModuleSpecifier } from "./javascript/javascriptModuleSpecifier.js";
 import {
   isCallExpression,
   isExportAllDeclaration,
   isExportNamedDeclaration,
-  isIdentifier,
   isImport,
   isImportDeclaration,
   isImportExpression,
-  isMemberExpression,
   isStringLiteral,
   isTSExternalModuleReference,
   isTSImportEqualsDeclaration,
@@ -49,6 +51,8 @@ interface ReferenceSourceImportRelationship {
   readonly parse_state: ReferenceSourceImportParseState;
   /** Distinguishes call-form CommonJS require from TS import-equals `requires`. */
   readonly resolutionStrategy?: "runtime-require";
+  /** Internal lookup origin for a proven createRequire URL base. */
+  readonly resolutionBasePath?: string;
 }
 
 interface ReferenceSourceParseFailure {
@@ -69,6 +73,16 @@ export const PARSEABLE_REFERENCE_SOURCE_LANGUAGES: ReadonlySet<string> =
 const safeModuleName = (node: Node | null | undefined): string | undefined => {
   if (isStringLiteral(node)) return node.value;
   return undefined;
+};
+
+const exactStringModuleName = (
+  node: Node | null | undefined,
+): string | undefined => {
+  if (node === null || node === undefined) return undefined;
+  const literal = readExactJavaScriptLiteral(node);
+  return literal.found && typeof literal.value === "string"
+    ? literal.value
+    : undefined;
 };
 
 const resolveSpecifier = (
@@ -92,24 +106,24 @@ const moduleSpecifierFromExpression = (
 ):
   | { specifier: string; parseState: ReferenceSourceImportParseState }
   | undefined => {
-  if (isStringLiteral(expression))
-    return { specifier: expression.value, parseState: "parsed" };
+  const specifier = exactStringModuleName(expression);
+  if (specifier !== undefined) return { specifier, parseState: "parsed" };
   if (
     isCallExpression(expression) &&
     isImport(expression.callee) &&
     expression.arguments.length > 0
   ) {
-    const first = expression.arguments[0];
-    if (isStringLiteral(first)) {
-      return { specifier: first.value, parseState: "parsed" };
-    }
-    return { specifier: "<dynamic-import>", parseState: "partial" };
+    const nestedSpecifier = exactStringModuleName(expression.arguments[0]);
+    return nestedSpecifier === undefined
+      ? { specifier: "<dynamic-import>", parseState: "partial" }
+      : { specifier: nestedSpecifier, parseState: "parsed" };
   }
   return undefined;
 };
 
 const appendRelationship = (
   relationships: ReferenceSourceImportRelationship[],
+  limitations: string[],
   input: {
     readonly fromPath: string;
     readonly to: string | undefined;
@@ -117,9 +131,16 @@ const appendRelationship = (
     readonly parseState: ReferenceSourceImportParseState;
     readonly resolution?: ReferenceSourceImportResolution;
     readonly resolutionStrategy?: "runtime-require";
+    readonly resolutionBasePath?: string;
   },
 ): void => {
   if (input.to === undefined) return;
+  if (input.to.length === 0) {
+    limitations.push(
+      `Empty module specifier in ${input.fromPath} was not recorded as a relationship.`,
+    );
+    return;
+  }
   relationships.push({
     from_path: input.fromPath,
     to: input.to,
@@ -129,6 +150,26 @@ const appendRelationship = (
     ...(input.resolutionStrategy === undefined
       ? {}
       : { resolutionStrategy: input.resolutionStrategy }),
+    ...(input.resolutionBasePath === undefined
+      ? {}
+      : { resolutionBasePath: input.resolutionBasePath }),
+  });
+};
+
+const appendImportEquals = (
+  statement: Node,
+  from_path: string,
+  relationships: ReferenceSourceImportRelationship[],
+  limitations: string[],
+): void => {
+  if (!isTSImportEqualsDeclaration(statement)) return;
+  const reference = statement.moduleReference;
+  if (!isTSExternalModuleReference(reference)) return;
+  appendRelationship(relationships, limitations, {
+    fromPath: from_path,
+    to: safeModuleName(reference.expression),
+    kind: "requires",
+    parseState: "parsed",
   });
 };
 
@@ -136,10 +177,11 @@ const extractImportDeclarations = (
   body: readonly Node[],
   from_path: string,
   relationships: ReferenceSourceImportRelationship[],
+  limitations: string[],
 ): void => {
   for (const statement of body) {
     if (isImportDeclaration(statement)) {
-      appendRelationship(relationships, {
+      appendRelationship(relationships, limitations, {
         fromPath: from_path,
         to: safeModuleName(statement.source),
         kind: "imports",
@@ -150,18 +192,27 @@ const extractImportDeclarations = (
 
     if (isExportNamedDeclaration(statement)) {
       if (statement.source !== null && statement.source !== undefined) {
-        appendRelationship(relationships, {
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: safeModuleName(statement.source),
           kind: "imports",
           parseState: "parsed",
         });
-      }
+      } else if (
+        statement.declaration !== null &&
+        statement.declaration !== undefined
+      )
+        appendImportEquals(
+          statement.declaration,
+          from_path,
+          relationships,
+          limitations,
+        );
       continue;
     }
 
     if (isExportAllDeclaration(statement)) {
-      appendRelationship(relationships, {
+      appendRelationship(relationships, limitations, {
         fromPath: from_path,
         to: safeModuleName(statement.source),
         kind: "imports",
@@ -171,21 +222,13 @@ const extractImportDeclarations = (
     }
 
     if (isTSImportEqualsDeclaration(statement)) {
-      const reference = statement.moduleReference;
-      if (isTSExternalModuleReference(reference)) {
-        appendRelationship(relationships, {
-          fromPath: from_path,
-          to: safeModuleName(reference.expression),
-          kind: "requires",
-          parseState: "parsed",
-        });
-      }
+      appendImportEquals(statement, from_path, relationships, limitations);
       continue;
     }
 
     if (isTSModuleDeclaration(statement)) {
       if (statement.declare === true && isStringLiteral(statement.id)) {
-        appendRelationship(relationships, {
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: statement.id.value,
           kind: "declares-module",
@@ -197,30 +240,12 @@ const extractImportDeclarations = (
   }
 };
 
-const isRequireCallee = (callee: Node | null | undefined): boolean => {
-  if (isIdentifier(callee) && callee.name === "require") return true;
-  if (
-    isMemberExpression(callee) &&
-    isIdentifier(callee.object) &&
-    callee.object.name === "require" &&
-    ((!callee.computed && isIdentifier(callee.property)) ||
-      isStringLiteral(callee.property))
-  ) {
-    const propertyName = isIdentifier(callee.property)
-      ? callee.property.name
-      : isStringLiteral(callee.property)
-        ? callee.property.value
-        : undefined;
-    return propertyName === "resolve" || propertyName === "main";
-  }
-  return false;
-};
-
 const extractRequireAndDynamicImports = (
   body: readonly Node[],
   from_path: string,
   relationships: ReferenceSourceImportRelationship[],
-  unshadowedRequireCalls: ReadonlySet<CallExpression>,
+  limitations: string[],
+  requireCalls: ReadonlyMap<CallExpression, ReferenceSourceRequireCall>,
 ): void => {
   // Single traversal owner: iterative, VISITOR_KEYS-gated, no recursion over
   // loc/comment objects. Survives deeply nested generated member chains that
@@ -236,8 +261,8 @@ const extractRequireAndDynamicImports = (
 
   for (const call of expressions) {
     if (isImportExpression(call)) {
-      const specifier = safeModuleName(call.source);
-      appendRelationship(relationships, {
+      const specifier = exactStringModuleName(call.source);
+      appendRelationship(relationships, limitations, {
         fromPath: from_path,
         to: specifier ?? "<dynamic-import>",
         kind: "imports",
@@ -246,29 +271,38 @@ const extractRequireAndDynamicImports = (
       });
       continue;
     }
-    const first = call.arguments[0];
-    if (
-      isRequireCallee(call.callee) &&
-      unshadowedRequireCalls.has(call) &&
-      isModuleExpression(first)
-    ) {
-      const result = moduleSpecifierFromExpression(first);
+    // The shared exact-literal reader owns argument exactness: it unwraps
+    // runtime-transparent TS wrappers (`as const`, `!`, `satisfies`) and
+    // admits quoted and expression-free template spellings alike.
+    const requireCall = requireCalls.get(call);
+    if (requireCall !== undefined) {
+      const result = moduleSpecifierFromExpression(requireCall.arguments?.[0]);
       if (result !== undefined) {
-        appendRelationship(relationships, {
+        const uncertainResolution = requireCall.resolutionBase === "unknown";
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: result.specifier,
           kind: "requires",
-          parseState: result.parseState,
-          resolutionStrategy: "runtime-require",
+          parseState: uncertainResolution ? "partial" : result.parseState,
+          ...(uncertainResolution ? { resolution: "unknown" } : {}),
+          ...(uncertainResolution
+            ? {}
+            : { resolutionStrategy: "runtime-require" as const }),
+          ...(typeof requireCall.resolutionBase === "object"
+            ? {
+                resolutionBasePath: requireCall.resolutionBase.path,
+              }
+            : {}),
         });
       }
       continue;
     }
 
+    const first = call.arguments[0];
     if (isImport(call.callee) && isModuleExpression(first)) {
       const result = moduleSpecifierFromExpression(first);
       if (result !== undefined) {
-        appendRelationship(relationships, {
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: result.specifier,
           kind: "imports",
@@ -371,12 +405,13 @@ export const parseReferenceSourceImports = (
   }
 
   const relationships: ReferenceSourceImportRelationship[] = [];
-  extractImportDeclarations(ast.program.body, path, relationships);
+  extractImportDeclarations(ast.program.body, path, relationships, limitations);
   extractRequireAndDynamicImports(
     ast.program.body,
     path,
     relationships,
-    unshadowedReferenceSourceRequireCalls(ast, path),
+    limitations,
+    referenceSourceRequireCalls(ast, path),
   );
 
   return {

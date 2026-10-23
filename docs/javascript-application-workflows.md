@@ -183,6 +183,11 @@ registrations/removals and dispatch, Node timers and cancellation handles, async
 `node:child_process` creation and ownership, configuration sources and direct
 defaults, request construction and response consumers, parse/coercion/
 validation boundaries, and built-in resource acquisition/release.
+Global timer, `fetch`, `WebSocket`, `JSON.parse`, and coercion calls receive
+these built-in effects only when the file has no visible possible write to that
+global, including a computed write through a global object. The check does not
+evaluate order or reachability, so a later or guarded polyfill write also
+removes the resolved effect.
 
 Local callback candidates do not establish a complete target set when a
 conditional write may leave a parameter, catch binding, or uninitialized
@@ -194,6 +199,17 @@ conditional block, can resolve a target; later writes do not replace an
 earlier read or captured alias. Unproved ordering across branches or function
 activations remains conservative. Returned-reference effects use the same
 read-position facts as call resolution.
+
+Returned-reference effects share one property-projection state per source read.
+When several paths reach that read, differing keys at the same depth become
+wildcards; differing depths become an unknown-depth selection. This retains a
+conservative superset of the represented local targets rather than enumerating
+every alias history or dropping paths at a query cap. It can add possible effects,
+including for finite projection cycles. Static limitations disclose this loss of
+precision; semantic graphs retain `dynamic-property` unknowns at the affected
+callee coordinates, and captured web bundles identify the affected script keys.
+These candidates do not prove runtime calls or mutations. Existing source-worker
+and result-admission limits still apply.
 
 Mutation tracking covers explicit member assignments, updates, deletion, and
 loop assignment targets, including the supported local aliases and shared

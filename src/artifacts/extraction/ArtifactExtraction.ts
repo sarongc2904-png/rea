@@ -1,9 +1,13 @@
+import { resolveAsarHeaderAdmission } from "../AsarHeader.js";
+import { locateGodotPck } from "../GodotPckLocation.js";
+import { withArtifactRegularFile } from "../ArtifactFileOperation.js";
 import type { ArtifactCleanupAttempt } from "../ArtifactResourceScope.js";
 import { lstat, realpath } from "node:fs/promises";
 
 import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 import { digestCanonicalValue } from "../../domain/canonicalDigest.js";
 import { AsarArtifactReader } from "../AsarArtifactReader.js";
+import { GodotPckArtifactReader } from "../GodotPckArtifactReader.js";
 import {
   ArtifactPathRegistry,
   normalizeArtifactPath,
@@ -20,6 +24,8 @@ import { SafeOutputTreeCreationFailure } from "../SafeOutputTreeCreationFailure.
 import { ZipArtifactReader } from "../ZipArtifactReader.js";
 import { isZipPackageFormat } from "../../domain/zipPackageFormat.js";
 import { MachOSliceArtifactReader } from "../MachOSliceArtifactReader.js";
+import { PyInstallerArtifactReader } from "../PyInstallerArtifactReader.js";
+import { containsPyInstallerArchive } from "../pyinstaller/CArchiveLayout.js";
 import {
   artifactExtractionResultSchema,
   type ArtifactExtractionResult,
@@ -33,10 +39,7 @@ import type {
   ArtifactResourceOwner,
   ArtifactResourceScope,
 } from "../ArtifactResourceScope.js";
-import {
-  isMachOFormat,
-  type BinaryTarget,
-} from "../../domain/binaryTargetTypes.js";
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import type { ArtifactInventorySnapshot } from "../../domain/artifactInventorySnapshot.js";
 import { scanArtifactInventoryInScope } from "../inventory/ArtifactInventory.js";
 import type { ArtifactIntegrityPolicyName } from "../../domain/artifactIntegrityPolicy.js";
@@ -65,11 +68,12 @@ const extractArtifactInScope = async (
   // Cancellation wins over every later refusal, including unsupported formats.
   abortIfNeeded(signal);
   const sourcePath = await realpath(input.inputPath);
-  await requireExtractableFormat(sourcePath, input);
+  await requireExtractableFormat(sourcePath, input, signal);
   const snapshot = await scanArtifactInventoryInScope(sourcePath, {
     resourceScope: input.resourceScope,
     signal,
     environment: input.environment,
+    asarHeaderAdmission: resolveAsarHeaderAdmission(input.environment),
     integrity: { mode: input.integrityPolicy },
   });
   return materializeArtifactInventoryInScope(
@@ -99,6 +103,18 @@ const materializeArtifactInventoryInScope = async (
   signal?: AbortSignal,
 ): Promise<ArtifactExtractionResult> => {
   abortIfNeeded(signal);
+  const containerMetadata = snapshot.occurrences.find(
+    (row) => row.logical_path === ".",
+  )?.format_metadata;
+  if (
+    containerMetadata?.kind === "godot-pck" &&
+    containerMetadata.directory_status !== "available"
+  )
+    throw new AnalysisUnsupportedTargetError(
+      "extract_artifact",
+      input.inputPath,
+      `Godot PCK directory is ${containerMetadata.directory_status}; its complete contents cannot be extracted`,
+    );
   const selectedOccurrences = snapshot.occurrences.filter(
     (occurrence) =>
       (occurrence.entry_kind === "file" || occurrence.entry_kind === "slice") &&
@@ -106,6 +122,11 @@ const materializeArtifactInventoryInScope = async (
   );
   const regularPaths = new Set(
     selectedOccurrences.map(({ logical_path: path }) => path),
+  );
+  const directoryPaths = new Set(
+    snapshot.occurrences
+      .filter(({ entry_kind }) => entry_kind === "directory")
+      .map(({ logical_path }) => logical_path),
   );
   const activeOccurrences = selectedOccurrences.filter(({ logical_path }) => {
     // Nested members remain represented by their containing regular file;
@@ -117,7 +138,7 @@ const materializeArtifactInventoryInScope = async (
       slash = path.lastIndexOf("/")
     ) {
       path = path.slice(0, slash);
-      if (regularPaths.has(path)) return false;
+      if (regularPaths.has(path) && !directoryPaths.has(path)) return false;
     }
     return true;
   });
@@ -225,7 +246,12 @@ const materializeSelection = async ({
       );
     byPath.set(path, item);
   }
-  const reader = await createReader(sourcePath, input);
+  const reader = await createReader(
+    sourcePath,
+    input,
+    inventory.manifest.root_format,
+    signal,
+  );
   const readerOwner: ArtifactResourceOwner = {
     kind: "reader" as const,
     reader,
@@ -236,6 +262,7 @@ const materializeSelection = async ({
   let completed: ArtifactExtractionResult | undefined;
   const extracted: ExtractedOccurrence[] = [];
   try {
+    await reader.prepareContainer?.(inventory.manifest.root_sha256, signal);
     try {
       output = await SafeOutputTree.create(input.outputRoot);
     } catch (cause: unknown) {
@@ -294,14 +321,15 @@ const writeSelectedEntries = async ({
   for await (const entry of reader.entries(signal)) {
     const path = normalizeArtifactPath(entry.path);
     registry.add(path, entry.kind);
+    // Logical declarations may share a query path with a real file. They do
+    // not consume that file's selection or participate in materialization.
+    if (entry.kind !== "file" && entry.kind !== "slice") continue;
     const selectedItem = byPath.get(path);
     if (selectedItem === undefined) {
-      if (entry.kind === "file" || entry.kind === "slice")
-        throw new ArtifactReaderFailure(
-          "integrity",
-          `Regular artifact entry is missing from inventory: ${path}`,
-        );
-      continue;
+      throw new ArtifactReaderFailure(
+        "integrity",
+        `Regular artifact entry is missing from inventory: ${path}`,
+      );
     }
     preflight(entry);
     const stream = await reader.open(entry, signal);
@@ -405,21 +433,46 @@ interface ExtractionInventory {
  */
 const requireExtractableFormat = async (
   path: string,
-  input: Pick<ArtifactExtractionInput, "inputPath" | "inputFormat">,
+  input: Pick<
+    ArtifactExtractionInput,
+    "inputPath" | "inputFormat" | "resourceScope"
+  >,
+  signal?: AbortSignal,
 ): Promise<boolean> => {
   const format = input.inputFormat;
   const directory = (await lstat(path)).isDirectory();
+  // A thin Mach-O has no child entries of its own: inventory lists only its
+  // root unless it carries an embedded pack, so it takes the same pack probe
+  // as ELF and PE while only the universal container has a slice reader.
   if (
     !directory &&
     format !== "asar" &&
-    !isMachOFormat(format) &&
+    format !== "godot-pck" &&
+    format !== "mach-o-universal" &&
     !isZipPackageFormat(format)
-  )
-    throw new AnalysisUnsupportedTargetError(
-      "extract_artifact",
-      input.inputPath,
-      `Artifact format has no extraction reader: ${format}`,
+  ) {
+    const pack = await withArtifactRegularFile(
+      path,
+      input.resourceScope,
+      signal,
+      async (handle) => {
+        const size = (await handle.stat()).size;
+        if (await locateGodotPck(handle, size, signal)) return true;
+        if (format !== "elf" && format !== "pe" && format !== "mach-o")
+          return false;
+        abortIfNeeded(signal);
+        const packaged = await containsPyInstallerArchive(handle, size, signal);
+        abortIfNeeded(signal);
+        return packaged;
+      },
     );
+    if (!pack)
+      throw new AnalysisUnsupportedTargetError(
+        "extract_artifact",
+        input.inputPath,
+        `Artifact format has no extraction reader: ${format}`,
+      );
+  }
   return directory;
 };
 
@@ -427,13 +480,21 @@ const createReader = async (
   path: string,
   input: Pick<
     ArtifactExtractionInput,
-    "inputPath" | "inputFormat" | "environment"
+    "inputPath" | "inputFormat" | "environment" | "resourceScope"
   >,
+  containerFormat: ArtifactGraphManifest["root_format"],
+  signal?: AbortSignal,
 ): Promise<ArtifactReader> => {
   const format = input.inputFormat;
-  if (await requireExtractableFormat(path, input))
+  if (containerFormat === "godot-pck") return new GodotPckArtifactReader(path);
+  if (containerFormat === "pyinstaller")
+    return new PyInstallerArtifactReader(path);
+  if (await requireExtractableFormat(path, input, signal))
     return new DirectoryArtifactReader(path);
-  if (format === "asar") return new AsarArtifactReader(path);
+  if (format === "asar")
+    return new AsarArtifactReader(path, {
+      headerAdmission: resolveAsarHeaderAdmission(input.environment),
+    });
   if (isZipPackageFormat(format)) return new ZipArtifactReader(path, format);
   return new MachOSliceArtifactReader(path, input.environment);
 };

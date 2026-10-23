@@ -7,7 +7,11 @@ import {
   ArtifactResourceScope,
   type ArtifactResourceOwner,
 } from "../artifacts/ArtifactResourceScope.js";
-import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import type { AnalysisCleanupLease } from "../artifacts/AnalysisCleanupLease.js";
+import {
+  ArtifactReaderFailure,
+  artifactPrimaryCleanupLeases,
+} from "../artifacts/ArtifactReader.js";
 import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
@@ -43,10 +47,7 @@ import {
   type LinuxHopperRelease,
   type LinuxPackageFamily,
 } from "./HopperReleaseFeed.js";
-import {
-  RegularFileCleanupFailure as RegularFileReadCleanupFailure,
-  withRegularFile,
-} from "./RegularFileRead.js";
+import { withRegularFile } from "./RegularFileRead.js";
 
 /** Metadata/key inspection budget, independent of the compressed package budget. */
 const RELEASE_METADATA_BYTES = 1024 * 1024;
@@ -922,7 +923,9 @@ export class LinuxHopperPublisher {
             "integrity",
             "Retained Hopper evidence exceeds its resource byte budget.",
           );
-        const bytes = await readBoundedFileBytes(handle, stats.size, signal);
+        const bytes = await readBoundedFileBytes(handle, stats.size, {
+          signal,
+        });
         if (bytes === undefined)
           throw new HopperReleaseError(
             "integrity",
@@ -934,7 +937,7 @@ export class LinuxHopperPublisher {
     ).catch((cause: unknown) => {
       if (
         resources === this.#resources &&
-        cause instanceof RegularFileReadCleanupFailure
+        cause instanceof RegularFileCleanupFailure
       )
         pendingCleanup.add(resources);
       throw cause;
@@ -1061,12 +1064,17 @@ export class LinuxHopperPublisher {
 export const retryLinuxHopperPublisherCleanup = async (): Promise<void> => {
   const causes: unknown[] = [];
   const observations = [];
+  const cleanupLeases = new Set<AnalysisCleanupLease>();
+  let cleanupLeaseAuthorityKnown = true;
   for (const scope of pendingCleanup) {
     try {
       await scope.close();
       pendingCleanup.delete(scope);
     } catch (cause: unknown) {
       causes.push(cause);
+      const leases = artifactPrimaryCleanupLeases(cause);
+      if (leases === undefined) cleanupLeaseAuthorityKnown = false;
+      else for (const lease of leases) cleanupLeases.add(lease);
       observations.push(
         ArtifactReaderFailure.cleanupObservation(
           cause,
@@ -1088,6 +1096,9 @@ export const retryLinuxHopperPublisherCleanup = async (): Promise<void> => {
       {
         cause: new AggregateError(causes, "Hopper publisher cleanup failures"),
         cleanup,
+        cleanupLeases: cleanupLeaseAuthorityKnown
+          ? [...cleanupLeases]
+          : undefined,
       },
     );
   }

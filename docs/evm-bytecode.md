@@ -19,8 +19,10 @@ rea inspect-evm-interface ./runtime.bin raw --json
 
 Initial real verification covers flat legacy bytecode on Linux x64 and unchanged
 bundled EVMole 0.9.3. EOF-style EF00 containers return `unsupported_target`,
-with the selected path and format reason. Provider/configuration failures retain
-their distinct unavailable-provider or capability classification.
+with the selected path and format reason. Selected-path resolution errors
+`ENOENT`, `ENOTDIR`, `ELOOP`, and `ENAMETOOLONG` are `invalid_request` path
+issues. Permission, resource, cancellation, provider, and cleanup failures retain
+their distinct classifications.
 The host must already provide util-linux `prlimit`, normally `/usr/bin/prlimit`;
 `REA_EVM_PRLIMIT_COMMAND` can select another absolute executable. REA installs
 no system tools and changes no user configuration. [Upstream provenance and
@@ -106,7 +108,13 @@ CLI keeps its existing complete result.
 
 Inputs are limited to 4 MiB, complete replies to 16 MiB and combined diagnostic
 output to 1 MiB. An owned worker has a 256 MiB JavaScript heap, 3 GiB virtual
-address-space limit, 30 CPU seconds and a 30-second command deadline. Virtual
+address-space limit and 30 CPU seconds. The worker command deadline is
+`timeout_ms` (default 30000 ms, integer 1 through 2147483647) on the next call,
+or `--timeout-ms` on `rea inspect-evm-interface`. Omission keeps 30000 ms.
+Those byte, address-space, and CPU ceilings have no runtime override, and
+`timeout_ms` does not raise them. An oversized selected carrier returns a
+non-retryable `resource_constraint` with resource `file-size` and its fixed
+input allowance in `reported_limits.maximum_input_bytes`. Virtual
 address space differs from resident memory. The worker retains inherited tighter
 soft/hard limits, reports its configured soft limits inline and leaves hard limits
 unchanged. WASM trap reservations are disabled

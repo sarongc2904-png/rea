@@ -43,12 +43,22 @@ export const PROCESS_COMPARISON_DIMENSIONS = [
   "filesystem",
   "process",
 ] as const;
+export type ProcessComparisonDimension =
+  (typeof PROCESS_COMPARISON_DIMENSIONS)[number];
+
+/** Caller-selected comparison policy; the clock is not persisted as policy. */
+export interface ProcessCaptureComparisonOptions {
+  readonly maxCaptureAgeMs?: number;
+  readonly now?: () => number;
+  readonly traceSpecification?: ProcessTraceSpecification;
+}
 
 /** Derive the overall comparison status from every process dimension. */
 export const deriveProcessComparisonStatus = (
   dimensions: readonly ComparisonStatus[],
 ): ComparisonStatus => {
   if (dimensions.includes("truncated")) return "truncated";
+  if (dimensions.includes("contradiction")) return "contradiction";
   if (
     dimensions.some((status) =>
       ["changed", "added", "removed"].includes(status),
@@ -72,16 +82,10 @@ export const processCaptureComparisonSchema = z
       z.object({ status: z.literal("unknown"), reason: z.string() }),
       z.object({
         status: z.literal("found"),
-        dimension: z.enum([
-          "terminal",
-          "interaction",
-          "exit",
-          "filesystem",
-          "process",
-        ]),
-        index: z.number().int().nonnegative(),
-        left_at_ms: z.number().int().nonnegative().nullable(),
-        right_at_ms: z.number().int().nonnegative().nullable(),
+        dimension: z.enum(PROCESS_COMPARISON_DIMENSIONS),
+        index: z.int().nonnegative(),
+        left_at_ms: z.int().nonnegative().nullable(),
+        right_at_ms: z.int().nonnegative().nullable(),
         left: jsonValueSchema.nullable(),
         right: jsonValueSchema.nullable(),
       }),
@@ -379,7 +383,7 @@ const applyTraceVerdict = (
 
 type ComparisonDimensions = Pick<
   ProcessCaptureComparison,
-  "terminal" | "interaction" | "exit" | "filesystem" | "process"
+  ProcessComparisonDimension
 >;
 
 const compareDimensions = (
@@ -446,11 +450,7 @@ const compareDimensions = (
 export const compareProcessCaptures = (
   left: ProcessCapture,
   right: ProcessCapture,
-  options: {
-    readonly maxCaptureAgeMs?: number;
-    readonly now?: () => number;
-    readonly traceSpecification?: ProcessTraceSpecification;
-  } = {},
+  options: ProcessCaptureComparisonOptions = {},
 ): ProcessCaptureComparison => {
   assertComparable(left, right, options);
   const sameNormalization = sameJsonValue(

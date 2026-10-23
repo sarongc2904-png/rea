@@ -3,11 +3,8 @@ import {
   JAVASCRIPT_RUNTIME_RECONCILIATION_PROVIDER,
   MANAGED_WORKFLOW_PROVIDER,
 } from "../InvestigationProviders.js";
-import {
-  isImmutableEvidence,
-  parseEvidence,
-  type Evidence,
-} from "../../domain/evidence.js";
+import { isImmutableEvidence, type Evidence } from "../../domain/evidence.js";
+import { safeParseEvidence } from "../../domain/evidenceValidation.js";
 import {
   type AnalysisInputIssue,
   AnalysisInputError,
@@ -184,15 +181,12 @@ const staticRuntimeSource = (
     evidence.normalized_result,
     [...path, "normalized_result"],
   );
-  const unmatchedLink = result.evidence_links.find(
-    (evidenceId) => !evidence.evidence_links.includes(evidenceId),
+  assertResultEvidenceLinksInEnvelope(
+    result.evidence_links,
+    evidence,
+    path,
+    "Runtime reconciliation result",
   );
-  if (unmatchedLink !== undefined)
-    throw invalidEvidence(
-      [...path, "normalized_result"],
-      "evidence_links",
-      `Runtime reconciliation result references Evidence ${unmatchedLink} outside its envelope.`,
-    );
   const applicationLayer = result.static_layers.find(
     ({ role }) => role === "application",
   );
@@ -229,15 +223,12 @@ const managedApplicationSource = (
     evidence.normalized_result,
     [...path, "normalized_result"],
   );
-  const unmatchedLink = result.evidence_links.find(
-    (evidenceId) => !evidence.evidence_links.includes(evidenceId),
+  assertResultEvidenceLinksInEnvelope(
+    result.evidence_links,
+    evidence,
+    path,
+    "Managed application graph result",
   );
-  if (unmatchedLink !== undefined)
-    throw invalidEvidence(
-      [...path, "normalized_result"],
-      "evidence_links",
-      `Managed application graph result references Evidence ${unmatchedLink} outside its envelope.`,
-    );
   return {
     evidence,
     graph: result.graph,
@@ -245,6 +236,25 @@ const managedApplicationSource = (
     rootArtifactSha256: result.root_artifact_sha256,
     semanticGraph: null,
   };
+};
+
+const assertResultEvidenceLinksInEnvelope = (
+  resultEvidenceLinks: readonly string[],
+  evidence: Evidence,
+  path: readonly (string | number)[],
+  resultLabel:
+    | "Runtime reconciliation result"
+    | "Managed application graph result",
+): void => {
+  const unmatchedLink = resultEvidenceLinks.find(
+    (evidenceId) => !evidence.evidence_links.includes(evidenceId),
+  );
+  if (unmatchedLink !== undefined)
+    throw invalidEvidence(
+      [...path, "normalized_result"],
+      "evidence_links",
+      `${resultLabel} references Evidence ${unmatchedLink} outside its envelope.`,
+    );
 };
 
 const assertApplicationSubject = (
@@ -307,7 +317,7 @@ const requireProvider = (
     );
 };
 
-/** Parse unique, artifact-bound Evidence that may extend a native handoff. */
+/** Authenticate artifact-bound Evidence that may extend a native handoff. */
 export const parseNativeApplicationEvidence = (
   inputs: readonly unknown[],
   path: readonly (string | number)[] = [],
@@ -322,13 +332,6 @@ export const parseNativeApplicationEvidence = (
         [...path, withoutSubject],
         "subject",
         "Native handoff Evidence requires an artifact subject.",
-      );
-    const ids = parsed.map(({ evidence_id: id }) => id);
-    if (new Set(ids).size !== ids.length)
-      throw invalidEvidence(
-        path,
-        "evidence_id",
-        "Native handoff Evidence must be unique.",
       );
     return parsed;
   });
@@ -349,12 +352,9 @@ const parseEvidenceInput = (
   input: unknown,
   path: readonly (string | number)[],
 ): Evidence => {
-  try {
-    return parseEvidence(input);
-  } catch (cause: unknown) {
-    if (cause instanceof z.ZodError) throw zodInputFailure(cause, input, path);
-    throw cause;
-  }
+  const parsed = safeParseEvidence(input);
+  if (parsed.ok) return parsed.value;
+  throw zodInputFailure(parsed.error, input, path);
 };
 
 const parseCallerValue = <Value>(

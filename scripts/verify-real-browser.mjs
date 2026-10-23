@@ -42,6 +42,7 @@ import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
 import { closeVerifierResources } from "./lib/verifier-cleanup.mjs";
 import { requireOrdinaryWindowsVerifierCaller } from "./lib/windows-ordinary-user-verifier.mjs";
 import { verifyLargeScreenshotE2e } from "./lib/browser-screenshot-e2e.mjs";
+import { verifyViewportScreenshotE2e } from "./lib/browser-viewport-screenshot-e2e.mjs";
 import { verifyPopupEventCoverage } from "./lib/browser-popup-e2e.mjs";
 import { verifyBrowserNetworkEvidence } from "./lib/browser-network-e2e.mjs";
 import { verifyBrowserScriptExport } from "./lib/browser-script-export-e2e.mjs";
@@ -52,6 +53,7 @@ import { verifyBrowserCaptureMetadataBudget } from "./lib/browser-capture-metada
 import { artifactCliEvidence, artifactMcpResult } from "./lib/artifact-e2e.mjs";
 import { verifyScenarioEnvironment } from "./lib/browser-scenario-environment-e2e.mjs";
 import { verifyScenarioStorage } from "./lib/browser-scenario-storage-e2e.mjs";
+import { verifyScenarioStorageFingerprints } from "./lib/browser-scenario-storage-fingerprints-e2e.mjs";
 import { verifyScenarioServiceWorkers } from "./lib/browser-scenario-service-workers-e2e.mjs";
 import { verifyBrowserUrlUserInfo } from "./lib/browser-url-userinfo-e2e.mjs";
 
@@ -307,6 +309,11 @@ try {
     endpoint,
     targetId: target,
   });
+  process.stderr.write("Browser verifier: scenario storage fingerprints\n");
+  const scenarioStorageFingerprints = await verifyScenarioStorageFingerprints(
+    executable,
+    site.origin,
+  );
   process.stderr.write("Browser verifier: scenario service workers\n");
   const scenarioServiceWorkers = await verifyScenarioServiceWorkers(
     endpoint,
@@ -366,6 +373,11 @@ try {
 
   process.stderr.write("Browser verifier: large screenshot\n");
   const largeScreenshot = await verifyLargeScreenshotE2e(endpoint, site.origin);
+  process.stderr.write("Browser verifier: visual viewport screenshot\n");
+  const viewportScreenshot = await verifyViewportScreenshotE2e(
+    endpoint,
+    site.origin,
+  );
   process.stderr.write("Browser verifier: popup coverage\n");
   const popupEvents = await verifyPopupEventCoverage(executable);
   const networkEvidence = await verifyBrowserNetworkEvidence(
@@ -415,7 +427,9 @@ try {
     scenarioFailure,
     scenarioEnvironment,
     scenarioStorage,
+    scenarioStorageFingerprints,
     scenarioServiceWorkers,
+    viewportScreenshot,
     verified: true,
   };
 } catch (cause) {
@@ -546,14 +560,21 @@ async function verifyPageScopedTransport(provider, proxy, origin) {
   const disconnected = await disconnectedPromise;
   if (
     !disconnected.ok ||
-    disconnected.value.window.end_reason !== "target_terminated" ||
+    disconnected.value.window.end_reason !== "transport_disconnected" ||
     !disconnected.value.timeline.some(
-      ({ type }) => type === "target_terminated",
-    )
+      ({ type }) => type === "transport_disconnected",
+    ) ||
+    disconnected.value.timeline.some(({ type }) => type === "target_terminated")
   )
     throw new Error(
-      "Page-scoped CDP disconnect was not reported as target_terminated",
+      "Page-scoped CDP disconnect must report transport loss without claiming a target crash",
     );
+  const remaining = await provider.listTargets(
+    listBrowserTargetsInputSchema.parse({ cdp_endpoint: proxy.endpoint }),
+  );
+  if (!remaining.ok) throw remaining.error;
+  if (!remaining.value.targets.some(({ target_id }) => target_id === target))
+    throw new Error("Page-scoped CDP disconnect removed its live target");
 }
 
 async function browserExecutable() {

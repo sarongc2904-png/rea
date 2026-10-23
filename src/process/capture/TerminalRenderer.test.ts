@@ -100,6 +100,27 @@ it("trims only after normalization sees the full-width row", async () => {
   expect(frames[0]?.lines[0]).toBe("pid <pid>");
 });
 
+it.each([
+  { data: "界", cells: 2 },
+  // The pinned xterm Unicode table treats this emoji as one cell.
+  { data: "😀", cells: 1 },
+  { data: "e\u0301", cells: 1 },
+  { data: "ab", cells: 2 },
+])(
+  "normalizes the terminal cells of $data without extra padding",
+  async ({ data, cells }) => {
+    const { frames } = await renderFrames(data, (value) =>
+      value.replaceAll(" ", "_"),
+    );
+    expect(frames[0]?.lines).toEqual([
+      data + "_".repeat(20 - cells),
+      "_".repeat(20),
+      "_".repeat(20),
+      "_".repeat(20),
+    ]);
+  },
+);
+
 it("omits rendered frames with unknown expanded size and keeps later bounded states", async () => {
   const renderer = new TerminalRenderer({
     columns: 10,
@@ -168,7 +189,7 @@ it.each(["write", "resize"] as const)(
         runId: "failed-observation",
         temporaryRoot,
       });
-      expect(cleanup.terminal_renderer).toEqual({
+      expect(cleanup.report.terminal_renderer).toEqual({
         state: "cleaned",
         reason: null,
       });
@@ -213,7 +234,7 @@ it("retains disposal failures for a later cleanup retry", async () => {
       runId: "failed-disposal",
       temporaryRoot,
     });
-    expect(cleanup.terminal_renderer).toEqual({
+    expect(cleanup.report.terminal_renderer).toEqual({
       state: "failed",
       reason: failure.message,
     });

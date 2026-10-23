@@ -12,6 +12,7 @@ import {
 } from "../process/ExecFileOutput.js";
 import type { ProviderAvailability } from "../application/AnalysisProvider.js";
 import type { ProviderRejectionCode } from "../contracts/providerSelection.js";
+import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { adbCommandCapturedOutput } from "./AdbCommand.js";
 
@@ -140,20 +141,27 @@ export const inspectAdbClient = async (
         ? {}
         : { capturedOutput: adbCommandCapturedOutput(failure) }),
     };
-    if (failure?.outputTruncated === true)
+    if (failure?.outputTruncated === true) {
       throw new AnalysisResourceConstraintError(
         "inspect_adb_client",
         "memory",
         `adb version output exceeded the ${String(VERSION_MAX_OUTPUT_BYTES)}-byte capture budget`,
         { max_output_bytes: VERSION_MAX_OUTPUT_BYTES },
-        options,
+        {
+          ...options,
+          ...fixedAllowanceOptions(
+            `The adb version-output capture allowance of ${String(VERSION_MAX_OUTPUT_BYTES)} bytes (this release has no runtime override)`,
+            "capture",
+          ),
+        },
       );
+    }
     if (failure?.code === "ETIMEDOUT")
-      throw new AnalysisTimeoutError(
-        "inspect_adb_client",
-        VERSION_TIMEOUT_MS,
-        options,
-      );
+      throw new AnalysisTimeoutError("inspect_adb_client", VERSION_TIMEOUT_MS, {
+        ...options,
+        userMessage: `adb version probe reached its ${String(VERSION_TIMEOUT_MS)} ms deadline (deadlineExpired). This release has no runtime override.`,
+        remediationAction: `This ${String(VERSION_TIMEOUT_MS)} ms adb version probe has no runtime override. Allow execution, cleanup and delivery headroom in the outer MCP client deadline. Confirm outstanding work and cleanup before retrying.`,
+      });
     if (failure?.code === "ENOENT")
       throw new AdbConfigurationFailure(
         "binary_missing",

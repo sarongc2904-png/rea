@@ -1,11 +1,13 @@
 import { PROCESS_PROVIDER } from "../domain/process/processEvidenceProvider.js";
-import {
-  buildReconstructionObligationLedgerEvidenceValidated,
-  resolveReconstructionObligationLedgerRequest,
-} from "./ReconstructionObligationLedgerService.js";
+import { buildReconstructionObligationLedgerEvidence } from "./ReconstructionObligationLedgerService.js";
+import { resolveReconstructionObligationLedgerRequest } from "./ReconstructionObligationLedgerRequest.js";
+import { deriveReconstructionObligationCandidates } from "./ReconstructionObligationCandidates.js";
 import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../domain/process/processCaptureExample.js";
 import { createEvidence, type Evidence } from "../domain/evidence.js";
-import { createEvidenceBundle } from "../domain/evidenceBundle.js";
+import {
+  createEvidenceBundle,
+  type EvidenceBundle,
+} from "../domain/evidenceBundle.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import {
   reconstructionObligationLedgerSchema,
@@ -98,11 +100,7 @@ export const request = (
 export const build = (
   input: ReconstructionObligationLedgerInput,
 ): ReconstructionObligationLedger => {
-  const parsed = resolveReconstructionObligationLedgerRequest(input);
-  if (!parsed.ok) throw parsed.error;
-  const result = buildReconstructionObligationLedgerEvidenceValidated(
-    parsed.value,
-  );
+  const result = buildReconstructionObligationLedgerEvidence(input);
   if (!result.ok) throw result.error;
   return reconstructionObligationLedgerSchema.parse(
     result.value.normalized_result,
@@ -119,6 +117,63 @@ export const originalCases = (
     evidence_id: evidenceId,
     location: `/normalized_result/cases/${caseKind}`,
   }));
+
+/** Build a request whose packaged-process obligation closes as ready. */
+export const readyProcessLedgerRequest =
+  (): ReconstructionObligationLedgerInput => {
+    const capture = processEvidence();
+    const initial = build(request([capture]));
+    const obligation = initial.obligations[0];
+    if (obligation === undefined)
+      throw new Error("Expected process obligation");
+    const fixtureIds = obligation.required_case_kinds.map(
+      (caseKind) => `packaged.${caseKind}`,
+    );
+    const proof = boundProofEvidence("packaged", {
+      obligation_ids: [obligation.obligation_id],
+      fixture_ids: fixtureIds,
+      case_kinds: obligation.required_case_kinds,
+      verifier_ids: ["verifier.packaged"],
+      claim_ids: ["claim.process"],
+    });
+    return request([capture, proof], {
+      manifest: {
+        bindings: [
+          {
+            obligation_id: obligation.obligation_id,
+            owner: {
+              module_path: "src/processOwner.ts",
+              symbol: "runProcess",
+              owner_sha256: "2".repeat(64),
+            },
+            parser_type: null,
+            original_cases: originalCases(obligation, capture.evidence_id),
+            fixtures: obligation.required_case_kinds.map((caseKind) => ({
+              fixture_id: `packaged.${caseKind}`,
+              case_kind: caseKind,
+              authority: "packaged-process",
+              evidence_ids: [proof.evidence_id],
+            })),
+            verifier: {
+              verifier_id: "verifier.packaged",
+              claim_id: "claim.process",
+              command: "npm run verify:package -- process",
+              authority: "packaged-process",
+              status: "pass",
+              result_evidence_id: proof.evidence_id,
+              enumerated_obligation_ids: [obligation.obligation_id],
+              nondeterminism: {
+                mode: "partial-order",
+                specification:
+                  "Startup precedes teardown; worker completion is unordered.",
+              },
+            },
+          },
+        ],
+        contradictions: [],
+      },
+    });
+  };
 
 /** Create a minimal reviewed obligation for ledger closure scenarios. */
 export const reviewedObligation = (
@@ -149,3 +204,83 @@ export const reviewedObligation = (
   disposition: "active",
   review_evidence_ids: [evidenceId],
 });
+
+const authorityEvidence = (
+  label: string,
+  authority: "shipped-artifact" | "controlled-replay",
+) =>
+  createEvidence(
+    undefined,
+    { id: "fixture", name: "Fixture", version: "1" },
+    {
+      operation: "observe",
+      parameters: { label },
+      result: { present: true },
+      confidence: "observed",
+      authority,
+    },
+  );
+
+/**
+ * Request with one single-reference shipped-artifact obligation and one
+ * obligation citing two shipped-artifact records and one controlled-replay
+ * record. Shipped-artifact review references have candidate state while both
+ * reviewed obligations have reviewed source state.
+ */
+export const mixedAuthorityRequest =
+  (): ReconstructionObligationLedgerInput => {
+    const shipped = authorityEvidence("shipped", "shipped-artifact");
+    const otherShipped = authorityEvidence("other-shipped", "shipped-artifact");
+    const replay = authorityEvidence("replay", "controlled-replay");
+    return request([shipped, otherShipped, replay], {
+      reviewed_obligations: [
+        reviewedObligation("review.shipped", shipped.evidence_id),
+        {
+          ...reviewedObligation("review.mixed", shipped.evidence_id),
+          review_evidence_ids: [
+            shipped.evidence_id,
+            replay.evidence_id,
+            otherShipped.evidence_id,
+          ],
+        },
+      ],
+    });
+  };
+
+/** Summary buckets expected for {@link mixedAuthorityRequest}. */
+export const MIXED_AUTHORITY_SUMMARY = {
+  total: 2,
+  by_evidence_authority: [
+    { key: "shipped-artifact", count: 2 },
+    { key: "controlled-replay", count: 1 },
+    { key: "historical-reference", count: 0 },
+    { key: "external-service", count: 0 },
+    { key: "analyst-inference", count: 0 },
+  ],
+  by_source_state: [
+    { key: "candidate", count: 0 },
+    { key: "observed", count: 0 },
+    { key: "reviewed", count: 2 },
+    { key: "unknown", count: 0 },
+  ],
+} as const;
+
+/** Resolve fixture sources through the production request owner. */
+export const resolveRequest = (input: ReconstructionObligationLedgerInput) => {
+  const resolved = resolveReconstructionObligationLedgerRequest(input);
+  if (!resolved.ok) throw resolved.error;
+  return resolved.value;
+};
+
+/** Derive candidates from fixture requests after authenticating their sources. */
+export const deriveCandidates = (
+  bundle: EvidenceBundle,
+  reviewed: readonly ReviewedReconstructionObligation[],
+) =>
+  deriveReconstructionObligationCandidates(
+    resolveRequest({
+      evidence_bundle: bundle,
+      reviewed_obligations: [...reviewed],
+      manifest: { bindings: [], contradictions: [] },
+    }),
+  );

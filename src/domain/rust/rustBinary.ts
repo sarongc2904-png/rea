@@ -1,12 +1,37 @@
 import { z } from "zod";
 import { digestSchema } from "../digests.js";
-import { localPathStringSchema } from "../localPath.js";
+import {
+  absoluteLocalPathStringSchema,
+  localPathStringSchema,
+} from "../localPath.js";
+import { BINARY_ARCHITECTURES } from "../binaryTargetTypes.js";
+import {
+  machoSelectionContainsRange,
+  selectedSliceAgreesWithReport,
+  machoSliceArchitectureSchema,
+  machoTargetSelectionSchema,
+} from "../apple/machoTargetSelection.js";
+
+/** Preserve the format owner's architecture spelling separately from Evidence vocabulary. */
+export const rustArchitectureForSubject = (architecture: string) => {
+  switch (architecture) {
+    case "386":
+      return "x86";
+    case "amd64":
+      return "x86_64";
+    default:
+      return BINARY_ARCHITECTURES.find(
+        (supported) => supported === architecture,
+      );
+  }
+};
 
 /** Known revisions used to interpret compatible cargo-auditable documents. */
 export const RUST_AUDITABLE_FORMAT_VERSIONS = [0, 1, 8] as const;
 
-const index = z.number().int().nonnegative();
+const index = z.int().nonnegative();
 const rustcHash = z.string().regex(/^[0-9a-f]{40}$/u);
+export const rustPackageFeaturesSchema = z.array(z.string().min(1)).nullable();
 
 /** One embedded package, with omitted kind and root preserved as null and false. */
 export const rustPackageSchema = z.strictObject({
@@ -15,6 +40,7 @@ export const rustPackageSchema = z.strictObject({
   source: z.string().min(1),
   kind: z.enum(["runtime", "build"]).nullable(),
   dependencies: z.array(index),
+  features: rustPackageFeaturesSchema.default(null),
   root: z.boolean(),
 });
 
@@ -27,11 +53,11 @@ const dependencyEdgeSchema = z.strictObject({
 export const rustAuditableMetadataSchema = z.strictObject({
   section_name: z.enum([".dep-v0", "__DATA,.dep-v0"]),
   file_offset: index,
-  section_bytes: z.number().int().positive(),
-  compressed_bytes: z.number().int().positive(),
-  uncompressed_bytes: z.number().int().positive(),
+  section_bytes: z.int().positive(),
+  compressed_bytes: z.int().positive(),
+  uncompressed_bytes: z.int().positive(),
   /** Original embedded revision; null means the source omitted the field. */
-  format_version: z.number().int().nonnegative().max(0xffff_ffff).nullable(),
+  format_version: z.int().nonnegative().max(0xffff_ffff).nullable(),
   packages: z.array(rustPackageSchema),
   root_package_index: index.nullable(),
   dependency_edges: z.array(dependencyEdgeSchema),
@@ -53,9 +79,10 @@ export const rustcCommitSchema = z.strictObject({
 
 /** One explicit local executable or library, independent of a disassembler target. */
 export const inspectRustBinaryInputSchema = z.strictObject({
-  path: localPathStringSchema.describe(
+  path: absoluteLocalPathStringSchema.describe(
     "Absolute filesystem path to the selected executable or library",
   ),
+  architecture: machoSliceArchitectureSchema.exactOptional(),
 });
 
 /** Bounded cargo-auditable observation. A missing section is null, not an empty dependency list. */
@@ -70,6 +97,8 @@ export const rustBinarySchema = z
     architecture: z.string(),
     bits: z.union([z.literal(32), z.literal(64)]),
     byte_order: z.enum(["little", "big"]),
+    /** The universal slice that was read; file offsets stay inside it. */
+    selected_slice: machoTargetSelectionSchema.exactOptional(),
     auditable_metadata: rustAuditableMetadataSchema.nullable(),
     rustc_commit: rustcCommitSchema.nullable(),
     limitations: z.array(z.string()),
@@ -81,6 +110,7 @@ export const rustBinarySchema = z
       checkPackages(metadata, context);
     }
     checkRustc(report.artifact.bytes, report.rustc_commit, context);
+    checkSlice(report, context);
   });
 
 export type RustPackage = z.infer<typeof rustPackageSchema>;
@@ -275,6 +305,47 @@ const dependencyComponentInCycle = (
   if (component.length > 1) return true;
   const only = component[0];
   return only !== undefined && (edges[only]?.includes(only) ?? false);
+};
+
+const checkSlice = (report: RustBinary, context: z.RefinementCtx): void => {
+  const slice = report.selected_slice;
+  if (slice === undefined) return;
+  const ranges = [
+    { offset: slice.offset, bytes: 0 },
+    ...(report.auditable_metadata === null
+      ? []
+      : [
+          {
+            offset: report.auditable_metadata.file_offset,
+            bytes: report.auditable_metadata.section_bytes,
+          },
+        ]),
+    ...(report.rustc_commit?.hashes.map(({ file_offset: offset }) => ({
+      offset,
+      bytes: 48,
+    })) ?? []),
+  ];
+  if (
+    !selectedSliceAgreesWithReport(
+      slice,
+      report.format,
+      rustArchitectureForSubject(report.architecture),
+    ) ||
+    ranges.some(
+      ({ offset, bytes }) =>
+        !machoSelectionContainsRange(
+          slice,
+          report.artifact.bytes,
+          offset,
+          bytes,
+        ),
+    )
+  )
+    issue(
+      context,
+      ["selected_slice"],
+      "Selected universal slice must be a FAT slice of the artifact whose CPU matches the report's Mach-O architecture and that contains the reported file offsets.",
+    );
 };
 
 const checkRustc = (

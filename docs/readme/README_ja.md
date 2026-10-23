@@ -1,7 +1,7 @@
 <div align="center">
 
 [English](../../README.md) · [简体中文](README_zh.md) · [繁體中文](README_zh-TW.md) · **日本語** · [한국어](README_ko.md) · [Türkçe](README_tr.md) · [Русский](README_ru.md) · [Tiếng Việt](README_vi.md) · [ไทย](README_th.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [Français](README_fr.md) · [Українська](README_uk.md) · [Polski](README_pl.md) · [Português (Brasil)](README_pt-BR.md) · [العربية](README_ar.md) · [فارسی](README_fa.md) · [Bahasa Indonesia](README_id.md) · [Italiano](README_it.md)
-· [Ελληνικά](README_el.md) · [മലയാളം](README_ml.md)
+· [Ελληνικά](README_el.md) · [മലയാളം](README_ml.md) · [Roman Urdu](README_ur-Latn.md)
 
 # REA：あらゆるものをリバースエンジニアリング
 
@@ -137,20 +137,25 @@ npx rea-agents@latest setup
 
 ## 分析できる対象
 
-REA には Node.js 22.x（>=22.19）、24.x（>=24.11）、または 26+ と npm が必要です。追加のツールや対応ホストは、対象によって異なります。
+REA には Node.js 22.x（>=22.23.4）、24.x（>=24.22.1）、または 26+ (>=26.12.1) と npm が必要です。追加のツールや対応ホストは、対象によって異なります。
 
 | 対象                             | REA が返すもの                                                                              | 要件とガイド                                                                                                                                   |
 | -------------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | ネイティブバイナリ               | 疑似コード、アセンブリ、文字列、シンボル、呼び出し、参照                                    | Hopper、Ghidra、または IDA；[ネイティブ分析](../native-investigation.md)                                                                       |
 | オフライン ELF レイアウト        | セクション、セグメント、元のシンボル／再配置情報、静的解析によるセキュリティ対策の候補      | Linux x64 で利用者が用意する pwntools；[バイナリ診断](../binary-diagnostics.md)                                                                |
+| PE certificates                  | Authenticode WIN_CERTIFICATE entries and PKCS#7 signer/X.509 identity fields                | Built-in static PE inspection; [PE certificates](../pe-certificates.md)                                                                        |
 | EVM バイトコード                 | ディスパッチセレクター、バイトオフセット、推定された引数と状態変更の可否                    | Linux x64 上のローカルの生バイト／16 進数の入力ファイル；[オフライン EVM ガイド](../evm-bytecode.md)                                           |
 | Rust binaries                    | Embedded cargo-auditable dependency list                                                    | [Rust binaries](../rust-binaries.md)                                                                                                           |
+| ELF notes                        | PT_NOTE/SHT_NOTE owners, types, GNU build-id and ABI-tag fields                             | Built-in static ELF inspection; [ELF notes](../elf-notes.md)                                                                                   |
+| Erlang BEAM                      | IFF chunks, atoms, exports, and tables                                                      | Built-in static BEAM inspection; [Erlang BEAM](../erlang-beam.md)                                                                              |
 | 記録済みの Linux クラッシュ      | 生の note レコード、記録された全スレッドのレジスター／シグナル、任意のマッピング候補        | Linux x64 で利用者が用意する pwntools；GDB/pwndbg は任意；[記録済みクラッシュ](../recorded-crashes.md)                                         |
+| デスクトップのインストール先     | ランタイム候補、根拠ファイル、コンポーネントの目印、次の調査手順                            | 上限付きのディレクトリ・ヘッダー検査；[デスクトップアプリ](../desktop-applications.md)                                                         |
 | JavaScript / Electron            | モジュール、インポート、ソースマップ、ルート、IPC、ネイティブアドオンの関係                 | Node.js と npm；[アプリケーション分析](../javascript-application-workflows.md)                                                                 |
 | ウェブサイト                     | ページ構造、スクリプト、ネットワークの観測結果、依頼されたスクリーンショット                | Chrome 系ブラウザー；[ブラウザー分析](../browser-observation.md)                                                                               |
 | 保存済みのネットワークキャプチャ | リクエスト、レスポンス、取得可能なペイロード、ソース内の位置                                | HAR；mitmproxy ネイティブ形式のキャプチャには Linux 上の mitmdump；[キャプチャガイド](../web-network-captures.md)                              |
 | パケットキャプチャ               | エンドポイント、DNS、TLS SNI、プロトコル分布、HTTPリクエスト                                | 呼び出し側が用意した tshark と capinfos；[pcapガイド](../pcap-analysis.md)                                                                     |
 | .NET アセンブリ                  | メタデータ、CIL 命令、宣言されたネイティブ依存関係、ビルドの比較                            | 静的な検査；[マネージドコードのガイド](../managed-code-analysis.md)                                                                            |
+| PyInstaller                      | CArchive, PYZ, Python bytecode                                                              | Static inspection; [Python packaged applications](../python-packaged-applications.md)                                                          |
 | Android APK                      | マニフェストの宣言、クラス、逆コンパイルされたメソッド、参照                                | Linux/macOS/Windows x64 上のヘッドレス JADX と完全な JDK；[Android ガイド](../android-analysis.md)                                             |
 | Android デバイス                 | デバイス、パッケージ、プロセス、ログ、ダンプ、スクリーンキャプチャ、APK/ファイル転送        | 呼び出し側が用意した adb（エミュレーターまたは実機）；[ADB ガイド](../adb-device-analysis.md)                                                  |
 | JEBプロジェクト                  | エンジンによるプロジェクトユニット、アーティファクトのダイジェスト、型/メソッドの擬似コード | 呼び出し側が起動し MCP を提供する JEB クライアント（REA_JEB_MCP_URL で選択）；[JEB ガイド](../jeb-analysis.md)                                 |
@@ -265,6 +270,8 @@ npx rea-agents@latest setup
 
 - [インストールとセットアップ](../installation.md)：エージェントの登録、プロバイダーの設定、更新、アンインストール。
 - [準備状況の確認とトラブルシューティング](../installation.md#check-readiness-for-your-task)：特定のエージェントや分析エンジンを診断。
+- [CUDA / HIP](../gpu-code-objects.md)
+- [GGUF / safetensors](../model-artifacts.md)
 - [CLI と Evidence](../cli.md)：コマンド、プロバイダーの選択、スナップショット、インポート／エクスポート、終了ステータス。
 - [MCP 契約](../mcp-contracts.md)と[エージェント向けプロンプト](../mcp-prompts.md)：ツールの結果、セッション、ガイド付き調査。
 - [ツールカタログ](../mcp-contracts.md#generated-catalog)：ビルド時に生成されるツール、プロバイダー、CLI コマンドの一覧。

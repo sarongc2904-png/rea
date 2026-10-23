@@ -16,7 +16,7 @@ import {
   applyEdits,
   createScanner,
   format as formatJson,
-  parse as parseJsonc,
+  getNodeValue,
   parseTree,
   printParseErrorCode,
   type Edit,
@@ -57,7 +57,14 @@ export interface ClientConfigurationDocument {
   readonly legacyServers: Record<string, unknown>;
 }
 
-const objectSchema = z.record(z.string(), z.unknown());
+/** Admit source mappings without Zod's record clone dropping caller keys. */
+export const clientConfigurationRecordSchema = z
+  .custom<Record<string, unknown>>((value) => {
+    if (typeof value !== "object" || value === null) return false;
+    const prototype: unknown = Object.getPrototypeOf(value);
+    return prototype === null || prototype === Object.prototype;
+  })
+  .transform((value) => Object.fromEntries(Object.entries(value)));
 
 /** Compare parsed configuration values without depending on parser prototypes. */
 export const clientConfigurationValuesEqual = (
@@ -170,24 +177,27 @@ const parseDocument = (
   const errors: ParseError[] = [];
   // Accept a UTF-8 BOM without shifting diagnostics or editing the original text.
   const jsonText = text.startsWith("\uFEFF") ? ` ${text.slice(1)}` : text;
-  const document = parseJsonc(jsonText, errors, { allowTrailingComma: true });
+  const root = parseTree(jsonText, errors, { allowTrailingComma: true });
   const firstError = errors[0];
   if (firstError !== undefined)
     throw new SyntaxError(
       `Invalid JSON/JSONC at offset ${firstError.offset}: ${printParseErrorCode(firstError.error)}`,
     );
-  return requireObject(document, "The configuration root");
+  return requireObject(
+    root === undefined ? undefined : getNodeValue(root),
+    "The configuration root",
+  );
 };
 
 /** A parsed configuration whose structure, not its syntax, cannot hold MCP servers. */
 export class ClientConfigurationShapeError extends TypeError {}
 
-/** Validate and copy own properties, excluding non-record YAML values and parser-injected prototypes. */
+/** Validate source mappings and copy their own properties without rewriting values. */
 const requireObject = (
   value: unknown,
   description: string,
 ): Record<string, unknown> => {
-  const parsed = objectSchema.safeParse(value);
+  const parsed = clientConfigurationRecordSchema.safeParse(value);
   if (parsed.success) return parsed.data;
   throw new ClientConfigurationShapeError(`${description} must be an object`, {
     cause: parsed.error,
@@ -282,7 +292,9 @@ export const effectiveClientServer = (
 ): unknown =>
   Object.hasOwn(parsed.servers, name)
     ? parsed.servers[name]
-    : parsed.legacyServers[name];
+    : Object.hasOwn(parsed.legacyServers, name)
+      ? parsed.legacyServers[name]
+      : undefined;
 
 /**
  * Return `parsed.document` with `servers` at its server table. A legacy OpenCode
@@ -298,7 +310,9 @@ export const withClientServers = (
     return Object.hasOwn(servers, PRODUCT_IDENTITY.mcpServerKey)
       ? editDshDocument(
           parsed,
-          objectSchema.parse(servers[PRODUCT_IDENTITY.mcpServerKey]),
+          clientConfigurationRecordSchema.parse(
+            servers[PRODUCT_IDENTITY.mcpServerKey],
+          ),
         )
       : editDshDocument(parsed);
   const [key = "", nested] = parsed.serversPath;
@@ -307,7 +321,9 @@ export const withClientServers = (
   // ZCode `config.json` without an `mcp` object), so treat absence as empty.
   const outerValue = parsed.document[key];
   const outer =
-    outerValue === undefined ? {} : { ...objectSchema.parse(outerValue) };
+    outerValue === undefined
+      ? {}
+      : clientConfigurationRecordSchema.parse(outerValue);
   if (
     parsed.dialect === "opencode_v2" &&
     removeLegacy !== undefined &&
@@ -324,7 +340,7 @@ const valueAt = (
 ): unknown => {
   let current: unknown = document;
   for (const key of path) {
-    const object = objectSchema.safeParse(current);
+    const object = clientConfigurationRecordSchema.safeParse(current);
     if (!object.success || !Object.hasOwn(object.data, key)) return undefined;
     current = object.data[key];
   }
@@ -977,10 +993,11 @@ const withoutTrailingLineFeeds = (text: string): string => {
 };
 
 /**
- * Replace REA's TOML server tables and assignments. Comments that introduce a
- * following table stay. Codex also retains comments around REA's own table.
- * Text inside strings is not treated as a header. Only Grok Build reads the
- * root `disabled_mcp_servers` list that registration also edits.
+ * Replace REA's TOML server tables and assignments. Every comment line stays
+ * where it was, including comments before, inside, and after REA's own table;
+ * only blank lines that separated a removed table go with it. Text inside
+ * strings is not treated as a header. Only Grok Build reads the root
+ * `disabled_mcp_servers` list that registration also edits.
  */
 const upsertTomlServerSection = (
   originalText: string,
@@ -1004,6 +1021,8 @@ const upsertTomlServerSection = (
     cursor += line.length + 1;
   }
   const kept: string[] = [];
+  // Blank lines held until the next statement shows whether they belong to a
+  // removed REA table. Comments are user text and are never held.
   const pending: string[] = [];
   let skipping = false;
   let inlineServerTable = false;
@@ -1127,7 +1146,7 @@ const upsertTomlServerSection = (
       continue;
     }
     if (isBlankOrComment(line)) {
-      if (format === "toml" && line.trimStart().startsWith("#")) {
+      if (line.trimStart().startsWith("#")) {
         flushPending();
         kept.push(physical);
       } else pending.push(physical);
@@ -1167,6 +1186,9 @@ const upsertTomlServerSection = (
         ? `${fragment}${nl}`
         : `${trimmed}${nl}${nl}${fragment}${nl}`;
   }
+  // Removing a final table also drops the file's last line break.
+  if (originalText.endsWith("\n") && !body.endsWith("\n"))
+    body += originalText.endsWith("\r\n") ? "\r\n" : "\n";
   return bom ? `\uFEFF${body}` : body;
 };
 
@@ -1174,7 +1196,9 @@ const tomlServerEntry = (
   document: Record<string, unknown>,
   serverKey: string,
 ): unknown => {
-  const servers = objectSchema.safeParse(document.mcp_servers);
+  const servers = clientConfigurationRecordSchema.safeParse(
+    document.mcp_servers,
+  );
   if (!servers.success || !Object.hasOwn(servers.data, serverKey))
     return undefined;
   return servers.data[serverKey];
@@ -1248,7 +1272,9 @@ const serializeGrokConfiguration = (
 const withoutEmptyServerTable = (
   document: Record<string, unknown>,
 ): Record<string, unknown> => {
-  const servers = objectSchema.safeParse(document.mcp_servers);
+  const servers = clientConfigurationRecordSchema.safeParse(
+    document.mcp_servers,
+  );
   if (!servers.success || Object.keys(servers.data).length > 0) return document;
   const { mcp_servers: empty, ...rest } = document;
   void empty;
@@ -1269,17 +1295,12 @@ const serializeCodexConfiguration = (
     isEmptyClientConfigurationText(originalText)
   )
     return stringifyToml(document);
-  const upserted = upsertTomlServerSection(
+  const edited = upsertTomlServerSection(
     originalText,
     PRODUCT_IDENTITY.mcpServerKey,
     tomlServerEntry(document, PRODUCT_IDENTITY.mcpServerKey),
     "toml",
   );
-  // Removing a final table also drops the file's last line break.
-  const edited =
-    originalText.endsWith("\n") && !upserted.endsWith("\n")
-      ? `${upserted}${originalText.endsWith("\r\n") ? "\r\n" : "\n"}`
-      : upserted;
   return tomlTextHolds(edited, document) ? edited : stringifyToml(document);
 };
 
@@ -1289,7 +1310,9 @@ const tomlTextHolds = (
 ): boolean => {
   try {
     return clientConfigurationValuesEqual(
-      withoutEmptyServerTable(objectSchema.parse(parseClientToml(text))),
+      withoutEmptyServerTable(
+        clientConfigurationRecordSchema.parse(parseClientToml(text)),
+      ),
       withoutEmptyServerTable(document),
     );
   } catch (cause: unknown) {
@@ -1325,6 +1348,101 @@ const isJsonMember = (property: Node, key: string): boolean =>
 const effectiveJsonProperty = (object: Node, key: string): Node | undefined =>
   object.children?.findLast((property) => isJsonMember(property, key));
 
+/** The object a client reads at `path`, following the effective members. */
+const effectiveJsonObject = (
+  root: Node | undefined,
+  path: readonly string[],
+): Node | undefined => {
+  let node = root;
+  for (const key of path) {
+    if (node?.type !== "object") return undefined;
+    node = effectiveJsonProperty(node, key)?.children?.[1];
+  }
+  return node?.type === "object" ? node : undefined;
+};
+
+/**
+ * Earlier members of one server name repeated in the tables a client reads,
+ * in document order. Parsing keeps only the last member, as clients do.
+ */
+export interface ShadowedClientServers {
+  readonly servers: readonly unknown[];
+  /** Repeats among OpenCode V1 members beside a native V2 table. */
+  readonly legacyServers: readonly unknown[];
+}
+
+const NO_SHADOWED_SERVERS: ShadowedClientServers = Object.freeze({
+  servers: [],
+  legacyServers: [],
+});
+
+// Token codes follow the pinned jsonc-parser scanner, as JSON_COMMA does.
+const JSON_STRING = 10 satisfies SyntaxKind;
+const JSON_EOF = 17 satisfies SyntaxKind;
+
+/** A conservative duplicate check using the parser's own string decoder. */
+const hasRepeatedJsonString = (text: string, name: string): boolean => {
+  const scanner = createScanner(text, true);
+  let matches = 0;
+  for (let token = scanner.scan(); token !== JSON_EOF; token = scanner.scan()) {
+    if (token === JSON_STRING && scanner.getTokenValue() === name) {
+      matches += 1;
+      if (matches === 2) return true;
+    }
+  }
+  return false;
+};
+
+/** Values of the earlier members named `name` in `object`. */
+const shadowedJsonMembers = (
+  object: Node | undefined,
+  name: string,
+): readonly unknown[] =>
+  (object?.children ?? [])
+    .filter((property) => isJsonMember(property, name))
+    .slice(0, -1)
+    .map((property): unknown => {
+      const value = property.children?.[1];
+      return value === undefined ? undefined : getNodeValue(value);
+    });
+
+/**
+ * Earlier members of `name` that removing its effective entry would make
+ * effective, so a removal decision must cover them too. Locating them needs a
+ * syntax tree of the whole document, which is built only when the name's
+ * string token occurs more than once.
+ */
+export const shadowedClientServers = (
+  text: string,
+  parsed: ClientConfigurationDocument,
+  name: string,
+): ShadowedClientServers => {
+  // TOML rejects repeated keys, Hermes parses YAML with unique keys, and the
+  // Harness owner edits REA's entry by id rather than through a server table.
+  if (
+    parsed.dialect === "toml" ||
+    parsed.dialect === "grok" ||
+    parsed.dialect === "hermes" ||
+    parsed.dialect === "dsh" ||
+    !hasRepeatedJsonString(text, name)
+  )
+    return NO_SHADOWED_SERVERS;
+  const root = parseTree(text, [], { allowTrailingComma: true });
+  return {
+    servers: shadowedJsonMembers(
+      effectiveJsonObject(root, parsed.serversPath),
+      name,
+    ),
+    legacyServers:
+      parsed.dialect === "opencode_v2" && !OPENCODE_V2_MCP_SETTINGS.has(name)
+        ? shadowedJsonMembers(
+            effectiveJsonObject(root, parsed.serversPath.slice(0, 1)),
+            name,
+          )
+        : [],
+  };
+};
+
 /** Apply one edit and format the lines it touched, as `modify` does. */
 const applyFormattedJsonEdit = (text: string, edit: Edit): string => {
   const edited = applyEdits(text, [edit]);
@@ -1345,38 +1463,32 @@ const applyFormattedJsonEdit = (text: string, edit: Edit): string => {
   );
 };
 
-/**
- * Delete a property by its JSONC AST span and the separator needed to keep its
- * parent object valid. All whitespace and comments outside those tokens stay
- * byte-for-byte in place.
- */
-const deleteJsonProperty = (
+/** Remove selected member spans and only the separators needed by kept members. */
+const deleteJsonMembers = (
   text: string,
   object: Node,
-  property: Node,
+  properties: readonly Node[],
 ): string => {
   const siblings = object.children ?? [];
-  const propertyIndex = siblings.indexOf(property);
-  const previous = siblings[propertyIndex - 1];
-  const next = siblings[propertyIndex + 1];
-  const comma = nextJsoncToken(
-    text,
-    previous === undefined
-      ? property.offset + property.length
-      : previous.offset + previous.length,
-  );
-  if (
-    propertyIndex < 0 ||
-    (comma.kind !== JSON_COMMA &&
-      (previous !== undefined || next !== undefined))
-  )
-    throw new TypeError("JSON property separator was not found");
-  const edits = [
-    { offset: property.offset, length: property.length, content: "" },
-    ...(comma.kind === JSON_COMMA
-      ? [{ offset: comma.offset, length: 1, content: "" }]
-      : []),
-  ];
+  const removed = new Set(properties);
+  const anyKept = siblings.some((member) => !removed.has(member));
+  const edits: Edit[] = [];
+  let earlierKept = false;
+  for (const [index, member] of siblings.entries()) {
+    if (removed.has(member))
+      edits.push({ offset: member.offset, length: member.length, content: "" });
+    else earlierKept = true;
+    const separator = nextJsoncToken(text, member.offset + member.length);
+    const next = siblings[index + 1];
+    if (separator.kind !== JSON_COMMA && next !== undefined)
+      throw new TypeError("JSON property separator was not found");
+    // Keep the separator before the next retained member, matching the
+    // existing single-member deletion rule. JSONC may retain a trailing comma.
+    const keepSeparator =
+      next === undefined ? anyKept : earlierKept && !removed.has(next);
+    if (separator.kind === JSON_COMMA && !keepSeparator)
+      edits.push({ offset: separator.offset, length: 1, content: "" });
+  }
   return applyEdits(text, edits);
 };
 
@@ -1391,12 +1503,13 @@ export interface ClientConfigurationShadowedMember {
  * Set or delete the member a client reads at `path`, keeping every byte
  * outside that member. Shadowed duplicates stay in place, and deleting a
  * member that shadows one is refused so the earlier member never becomes
- * active, whatever its ownership.
+ * active, unless the caller has established removal authority for that path.
  */
 const editJsonMember = (
   text: string,
   path: readonly string[],
   value: unknown,
+  removeShadowedMembers: boolean,
 ): Result<string, ClientConfigurationShadowedMember> => {
   let object = parseTree(text, [], { allowTrailingComma: true });
   for (const [index, key] of path.entries()) {
@@ -1442,11 +1555,31 @@ const editJsonMember = (
         (sibling) => sibling !== property && isJsonMember(sibling, key),
       )
     )
-      return err({ kind: "shadowed_member", path });
-    return ok(deleteJsonProperty(text, object, property));
+      return removeShadowedMembers
+        ? ok(
+            deleteJsonMembers(
+              text,
+              object,
+              (object.children ?? []).filter((sibling) =>
+                isJsonMember(sibling, key),
+              ),
+            ),
+          )
+        : err({ kind: "shadowed_member", path });
+    return ok(deleteJsonMembers(text, object, [property]));
   }
   throw new TypeError("JSON edit path is empty");
 };
+
+/** Edit authority beyond the members a client reads. */
+export interface ClientConfigurationEditOptions {
+  /**
+   * Exact deleted paths whose repeated members the caller may remove.
+   * Uninstall must establish ownership of every shadowed member; setup may
+   * grant replacement authority for an explicitly superseded registration.
+   */
+  readonly removeShadowedMembersAt?: readonly (readonly string[])[];
+}
 
 /**
  * Serialize a validated client document, retaining JSONC and TOML comments.
@@ -1457,6 +1590,7 @@ export const serializeClientConfiguration = (
   format: ClientConfigurationFormat | undefined,
   originalText?: string,
   editedPaths?: readonly (readonly string[])[],
+  options: ClientConfigurationEditOptions = {},
 ): Result<string, ClientConfigurationShadowedMember> => {
   if (format === undefined || format === "unsupported")
     throw new TypeError("client does not have a supported MCP config format");
@@ -1477,7 +1611,16 @@ export const serializeClientConfiguration = (
     return ok(`${JSON.stringify(document, null, 2)}\n`);
   let text = originalText;
   for (const path of editedPaths) {
-    const edited = editJsonMember(text, path, valueAt(document, path));
+    const edited = editJsonMember(
+      text,
+      path,
+      valueAt(document, path),
+      options.removeShadowedMembersAt?.some(
+        (allowed) =>
+          allowed.length === path.length &&
+          allowed.every((key, index) => key === path[index]),
+      ) ?? false,
+    );
     if (!edited.ok) return edited;
     text = edited.value;
   }
@@ -1552,10 +1695,11 @@ export const clientRegistrationEntry = (
         ...(Object.keys(environment).length === 0 ? {} : { env: environment }),
       };
     case "opencode_v2":
-      // V2 connects servers unless `disabled` is true.
+      // Override lower-priority disabled flags when refreshing a V2 registration.
       return {
         type: "local",
         command: [...command],
+        disabled: false,
         ...(Object.keys(environment).length === 0
           ? {}
           : { environment: { ...environment } }),

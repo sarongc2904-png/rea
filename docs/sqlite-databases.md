@@ -57,11 +57,21 @@ triggers or arbitrary SQL.
 Rows are optional. `table` selects one exact ordinary-table name. `columns`
 (CLI repeated `--column`) selects exact visible column names in the requested
 order; omission selects all visible columns, including generated columns.
-Unselected cells are not evaluated or projected. Malformed column-name bytes
+Unselected cells are not evaluated or projected. A selected virtual generated
+column whose expression needs a function REA's connection lacks (extensions and
+application functions are not loaded), or raises an SQL error for a sampled
+row, is refused as `capability_unavailable`. The error names the table and
+each failing selected column with SQLite's message, and recommends only columns
+whose sampled values were read; stored and other generated cells stay readable. Malformed column-name bytes
 cause a format refusal when all columns are requested. In inventory scope, an explicit valid subset can
 still be sampled without decoding unrelated malformed column names.
 Column selection requires a
-table and at least one name; empty-string identifiers are valid. `row_limit`
+table and at least one name; empty-string identifiers are valid. SQLite counts
+every projected name, including a repeated name, against its native
+result-column capacity; a wider projection is refused as `resource_constraint`
+with `resource: "capacity"`, reporting the selected count and this connection's
+column limit. The selected database is readable and is not reported as
+malformed; request fewer columns per call instead. `row_limit`
 requires `table`, defaults to 20 and accepts positive safe integers. Samples
 remain subject to the byte and worker resource limits below, regardless of row count. The result reports
 the selected limit, returned count and whether more rows were observed. Row
@@ -102,8 +112,29 @@ bounds simultaneous input buffering and private snapshot/worker counts.
 
 The database and WAL together are limited to 256 MiB. SQLite values/records,
 SQL statements and the complete worker JSON reply each have a 16 MiB limit.
-The owned worker has a 256 MiB JavaScript heap limit and a 30-second inspection
-deadline. SQLite native allocations are separate from the JavaScript heap;
+The owned worker has a 256 MiB JavaScript heap limit and defaults to a 30,000 ms
+deadline. Select optional MCP `worker_timeout_ms`, or CLI
+`--worker-timeout-ms <milliseconds>`, to change the budget for that call. Values
+must be integer milliseconds from 1 to 2,147,483,647 (the runtime timer range).
+It covers worker startup, queries and reply writing, **not** DB/WAL snapshot
+acquisition, final reply reads, cleanup or delivery. Allow corresponding headroom
+in the MCP client's whole-call deadline; increasing only that deadline does not
+change the worker budget. No server restart is needed.
+
+The result's `worker_timeout_ms` reports the actual parent-supervised budget,
+including the default. Historical Evidence without this field has unknown
+execution settings, not an inferred default. Explicit input selection is also
+retained in Evidence parameters; omission stays omitted. Completed observations
+retained under cancellation or cleanup failure keep the same budget facts.
+Timeout errors name the selected milliseconds, exact CLI/MCP controls, and
+cleanup-before-retry requirements. Incomplete cleanup remains a blocker even
+when a larger budget is available.
+
+For example, `rea inspect-sqlite-database ./application.sqlite
+--worker-timeout-ms 60000 --json` selects 60 seconds; equivalent MCP input is
+`{"path":"/artifacts/application.sqlite","worker_timeout_ms":60000}`.
+
+SQLite native allocations are separate from the JavaScript heap;
 overall native heap and total resident memory are not capped. Row limits do not
 override these byte and resource limits. Resource-limit failures do not return
 an incomplete schema as successful complete evidence.

@@ -50,6 +50,27 @@ git submodule update --init third_party/binwalk third_party/unblob
 Normal REA builds and npm packages do not include or build these sources or
 engine binaries. See [upstream provenance](https://github.com/morluto/rea/blob/main/third_party/README.md).
 
+### Windows submodule checkout
+
+On Windows, the Unblob checkout stops with `error: invalid path`. Several
+upstream test fixture names under `tests/integration/` contain characters,
+trailing dots, or trailing spaces that NTFS does not allow; REA does not use
+those fixtures. Keep the clone, exclude that directory, and retry from the
+repository root in PowerShell:
+
+```powershell
+git -C third_party/unblob config core.protectNTFS false
+git -C third_party/unblob sparse-checkout set --no-cone '/*' '!/tests/integration/'
+git submodule update third_party/unblob
+```
+
+Both settings are required. While `core.protectNTFS` is enabled, Git for
+Windows also rejects index paths that the sparse pattern excludes; the pattern
+keeps the invalid names out of the worktree. The setting applies only to the
+Unblob submodule. In Git Bash, prefix the `sparse-checkout` command with
+`MSYS_NO_PATHCONV=1`; otherwise `!/tests/integration/` is rewritten as a
+Windows path.
+
 ## CLI and MCP
 
 ```sh
@@ -158,10 +179,34 @@ tree semantics, vulnerability scanning, emulation or hardware runtime capture.
   Supply a stable copy within the allowance. No in-place source modification.
 - One queued heavy operation per provider instance; Binwalk one thread and
   Unblob one worker. No automatic parallel extraction engines.
-- **120-second** deadline; inherited **1 GiB per-process address-space** limit,
+- Analysis defaults to **120 seconds**, from tool resolution and input snapshot
+  through inspection and its final private-workspace cleanup, or extraction
+  through report consumption and inventory, excluding queue waiting and retained
+  cleanup admission. Inspection has no publication phase. Select `analysis_timeout_ms` in either MCP operation or
+  `--analysis-timeout-ms` in either CLI command for slower analysis. Current
+  results retain the actual budget; an absent historical value means unknown.
+  Extraction publication and its final
+  cleanup start a separate **120-second** budget; select
+  `publication_timeout_ms` in MCP or `--publication-timeout-ms` in CLI for a slow
+  destination. Valid budgets are integers from 1 through 2,147,483,647 ms (the
+  timer representation limit). Publication timeouts identify their phase and
+  verified file progress; verified writes before atomic commit are not a claim
+  that output remains published after rollback. Caller cancellation applies to
+  both phases and final cleanup. Phase handoff, publication commit and final
+  completion also check monotonic elapsed time, so delayed timer callbacks
+  cannot revive an expired budget.
+- Analysis timeout recovery names the selected budget and the analysis control,
+  not the later publication control. Keep the client call timeout above analysis,
+  publication and cleanup headroom; keep the input/range/question unchanged.
+  Resolve any reported incomplete cleanup before retrying. Raising wall time
+  does not raise fixed CPU, memory, report, diagnostic or input limits.
+- Inherited **1 GiB per-process address-space** limit,
   120 CPU seconds and zero core-dump allowance through `prlimit`.
 - JSON reports: at most **8 MiB** and valid UTF-8; malformed encoding and
   oversized reports fail without repairing or truncating producer data.
+  Exit status 0 is not an empty result: a missing, empty, malformed or
+  oversized report fails with `unreadable_output`, its `report_state`, the
+  command, exit status and captured output. REA does not retry automatically.
   Diagnostic output is bounded with exact captured byte counts.
 - Default staging budget: **256 MiB** and **10,000 entries**, configurable using
   `max_output_bytes` / `max_output_files` (CLI `--max-output-bytes` /

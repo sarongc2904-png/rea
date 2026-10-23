@@ -1,3 +1,5 @@
+import { nativeProcedureInputSchema } from "../domain/native/nativeProcedureInput.js";
+import { CALL_RELATIONSHIP_TRAVERSALS } from "./CallRelationshipTraversal.js";
 import { z } from "zod";
 
 import type {
@@ -6,8 +8,11 @@ import type {
   AnalysisOperationPort,
   ExecutionOptions,
 } from "./AnalysisProvider.js";
-import type { EnhancedToolName } from "../contracts/enhancedInputs.js";
-import { enhancedInputSchemas } from "../contracts/enhancedInputs.js";
+import {
+  enhancedInputSchemas,
+  type CallRelationshipDirection,
+  type EnhancedToolName,
+} from "../contracts/enhancedInputs.js";
 import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
@@ -16,7 +21,6 @@ import {
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
-  functionDossierSchema,
   parseFunctionDossier,
   parseListCount,
   parseRelatedAddresses,
@@ -26,14 +30,27 @@ import {
 import { err, ok, type Result } from "../domain/result.js";
 import {
   categorizeSwiftTypes,
-  discoverObjcClasses,
   discoverObjcProtocols,
+  projectObjcClassCandidates,
+  selectObjcClassCandidates,
 } from "../domain/symbolAnalysis.js";
 import { inspectNativeDispatch } from "./native/NativeDispatchMetadataInspection.js";
 import { traceNativeValues } from "./native/NativeValueTrace.js";
 import { traceNativeUiAction } from "./native/NativeUiActionTrace.js";
 import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
+import { addressedValueSchema } from "../domain/native/nativeInventory.js";
+import {
+  nativeDispatchMetadataResultSchema,
+  MAX_DISPATCH_METADATA_RECORDS,
+} from "../domain/native/objcSwiftMetadata.js";
+import { isMachOFormat } from "../domain/binaryTargetTypes.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
+import {
+  machoTargetSelectionMatchesArchitecture,
+  machoTargetSelectionMatchesFormat,
+  profileMachoTargetSelection,
+  sameMachoTargetSelection,
+} from "../domain/apple/machoTargetSelection.js";
 
 import {
   invalidEnhancedInput,
@@ -136,8 +153,12 @@ export class EnhancedTools {
           ? this.executeValidated({ name, input: parsed.data }, signal)
           : invalidEnhancedInput(name, parsed.error);
       }
-      case "get_objc_protocols":
-        return this.executeValidated({ name, input: {} }, signal);
+      case "get_objc_protocols": {
+        const parsed = enhancedInputSchemas.get_objc_protocols.safeParse(input);
+        return parsed.success
+          ? this.executeValidated({ name, input: parsed.data }, signal)
+          : invalidEnhancedInput(name, parsed.error);
+      }
       case "batch_decompile": {
         const parsed = enhancedInputSchemas.batch_decompile.safeParse(input);
         return parsed.success
@@ -179,10 +200,13 @@ export class EnhancedTools {
   ): EnhancedResult {
     switch (call.name) {
       case "inspect_native_dispatch_metadata":
-        return this.#inspectNativeDispatchMetadata(
-          call.input.max_records,
+        return inspectNativeDispatch(this.analysis, call.input.max_records, {
           signal,
-        );
+          objcClassImportAddresses: call.input.objc_class_import_addresses,
+          objcClassImportAddressesComplete:
+            call.input.objc_class_import_addresses_complete,
+          maxInputBytes: call.input.max_input_bytes,
+        });
       case "get_objc_classes":
         return this.#objcClasses(call.input.pattern, signal);
       case "get_objc_protocols":
@@ -247,12 +271,7 @@ export class EnhancedTools {
     input: unknown,
     signal?: AbortSignal,
   ): EnhancedResult {
-    if (name === "analyze_function") {
-      const parsed = enhancedInputSchemas.analyze_function.safeParse(input);
-      if (!parsed.success) return invalidEnhancedInput(name, parsed.error);
-      return this.executeValidated({ name, input: parsed.data }, signal);
-    }
-    const parsed = enhancedInputSchemas.inspect_native_api.safeParse(input);
+    const parsed = nativeProcedureInputSchema.safeParse(input);
     if (!parsed.success) return invalidEnhancedInput(name, parsed.error);
     return this.executeValidated({ name, input: parsed.data }, signal);
   }
@@ -266,30 +285,133 @@ export class EnhancedTools {
   }
 
   async #inspectNativeApi(
-    input: z.output<typeof enhancedInputSchemas.inspect_native_api>,
+    input: z.output<typeof nativeProcedureInputSchema>,
     signal?: AbortSignal,
   ): EnhancedResult {
-    const analysisInput = enhancedInputSchemas.analyze_function.parse({
-      procedure: input.procedure,
-    });
-    const result = await this.#call("analyze_function", analysisInput, signal);
+    const result = await this.#call("analyze_function", input, signal);
     if (!result.ok) return result;
     const parsed = parseFunctionDossier(result.value);
     if (!parsed.ok) return parsed;
-    const dossier = functionDossierSchema.parse(parsed.value);
-    return ok(jsonValueSchema.parse(projectNativeApiInspection(dossier)));
+    return ok(jsonValueSchema.parse(projectNativeApiInspection(parsed.value)));
   }
 
   async #objcClasses(pattern: string, signal?: AbortSignal): EnhancedResult {
-    const names = await this.#allAddressed("list_names", signal);
-    return names.ok ? ok(discoverObjcClasses(names.value, pattern)) : names;
-  }
+    const namesExecution = await this.#observe("list_names", {}, signal);
+    if (!namesExecution.ok) return namesExecution;
+    const names = this.#parseAddressed(
+      "list_names",
+      namesExecution.value.result,
+    );
+    if (!names.ok) return names;
+    const candidates = selectObjcClassCandidates(names.value, pattern);
+    if (candidates.length === 0)
+      return ok(
+        projectObjcClassCandidates(candidates, {
+          bindings: [],
+          coverage: { status: "not_applicable", reason: null },
+        }),
+      );
 
-  #inspectNativeDispatchMetadata(
-    maxRecords: number,
-    signal?: AbortSignal,
-  ): EnhancedResult {
-    return inspectNativeDispatch(this.analysis, maxRecords, signal);
+    const addresses = [...new Set(candidates.map(({ address }) => address))];
+    const scannedAddresses = addresses.slice(0, MAX_DISPATCH_METADATA_RECORDS);
+    const bindingsExecution = await this.#observe(
+      "inspect_native_dispatch_metadata",
+      {
+        max_records: MAX_DISPATCH_METADATA_RECORDS,
+        objc_class_import_addresses: scannedAddresses,
+        objc_class_import_addresses_complete:
+          addresses.length <= MAX_DISPATCH_METADATA_RECORDS,
+      },
+      signal,
+    );
+    if (!bindingsExecution.ok) {
+      if (bindingsExecution.error._tag === "AnalysisCancelledError")
+        return bindingsExecution;
+      if (bindingsExecution.error._tag !== "AnalysisCapabilityUnavailableError")
+        return bindingsExecution;
+      return ok(
+        projectObjcClassCandidates(candidates, {
+          bindings: [],
+          coverage: {
+            status: "unknown",
+            reason: `Native class-import binding evidence is unavailable (${bindingsExecution.error._tag}).`,
+          },
+        }),
+      );
+    }
+
+    const native = nativeDispatchMetadataResultSchema.safeParse(
+      bindingsExecution.value.result,
+    );
+    const nameSubject = namesExecution.value.subject;
+    const bindingSubject = bindingsExecution.value.subject;
+    const namesSelection = profileMachoTargetSelection(
+      namesExecution.value.analysisProfile,
+    );
+    const nativeSelection = native.success
+      ? native.data.result.target_selection
+      : undefined;
+    if (
+      !native.success ||
+      nameSubject === null ||
+      nameSubject === undefined ||
+      bindingSubject === null ||
+      bindingSubject === undefined ||
+      nameSubject.sha256 !== bindingSubject.sha256 ||
+      nameSubject.architecture === undefined ||
+      bindingSubject.architecture === undefined ||
+      nameSubject.architecture !== bindingSubject.architecture ||
+      !isMachOFormat(nameSubject.format) ||
+      nameSubject.format !== bindingSubject.format ||
+      native.data.target_sha256 !== nameSubject.sha256 ||
+      native.data.target_architecture !== nameSubject.architecture ||
+      native.data.provider.id !== bindingsExecution.value.provider.id ||
+      namesExecution.value.analysisProfile?.provider.id !==
+        namesExecution.value.provider.id ||
+      nativeSelection === undefined ||
+      !machoTargetSelectionMatchesArchitecture(
+        nativeSelection,
+        nameSubject.architecture,
+      ) ||
+      !machoTargetSelectionMatchesFormat(nativeSelection, nameSubject.format) ||
+      !sameMachoTargetSelection(namesSelection, nativeSelection) ||
+      native.data.result.objc_class_import_bindings === undefined ||
+      native.data.result.objc_class_import_binding_coverage === undefined
+    )
+      return ok(
+        projectObjcClassCandidates(candidates, {
+          bindings: [],
+          coverage: {
+            status: "unknown",
+            reason:
+              "Native class-import facts did not prove matching artifact, architecture, and complete producer identity.",
+          },
+        }),
+      );
+
+    const coverage = native.data.result.objc_class_import_binding_coverage;
+    const inventoryLimitations = namesExecution.value.limitations;
+    const inventoryIncomplete = inventoryLimitations.length > 0;
+    const coverageReason = [
+      coverage.reason,
+      ...inventoryLimitations.map((limitation) => `list_names: ${limitation}`),
+    ]
+      .filter((reason): reason is string => reason !== null)
+      .join("; ");
+    return ok(
+      projectObjcClassCandidates(candidates, {
+        bindings: native.data.result.objc_class_import_bindings,
+        coverage: {
+          status:
+            coverage.status === "not_requested"
+              ? "unknown"
+              : coverage.status === "complete" && inventoryIncomplete
+                ? "partial"
+                : coverage.status,
+          reason: coverageReason.length === 0 ? null : coverageReason,
+        },
+      }),
+    );
   }
 
   async #objcProtocols(signal?: AbortSignal): EnhancedResult {
@@ -444,13 +566,12 @@ export class EnhancedTools {
   async #callGraph(
     input: {
       readonly address: string;
-      readonly direction: "forward" | "backward";
+      readonly direction: CallRelationshipDirection;
     },
     signal?: AbortSignal,
   ): EnhancedResult {
-    const relation = input.direction === "forward" ? "callees" : "callers";
-    const tool =
-      input.direction === "forward" ? "procedure_callees" : "procedure_callers";
+    const { relation, operation: tool } =
+      CALL_RELATIONSHIP_TRAVERSALS[input.direction];
     const limitations = new Set<string>();
     const resolved = await this.#observe(
       "procedure_address",
@@ -673,11 +794,19 @@ export class EnhancedTools {
   ) {
     const result = await this.#call(tool, {}, signal);
     if (!result.ok) return result;
-    const parsed = z
-      .array(z.object({ address: z.string(), value: z.string() }))
-      .safeParse(result.value);
+    return this.#parseAddressed(tool, result.value);
+  }
+
+  #parseAddressed(tool: "list_names" | "list_procedures", value: JsonValue) {
+    const parsed = z.array(addressedValueSchema).safeParse(value);
     return parsed.success
-      ? ok(parsed.data.map(({ address, value: name }) => ({ address, name })))
+      ? ok(
+          parsed.data.map(({ address, value: name, objc_class_label }) => ({
+            address,
+            name,
+            ...(objc_class_label === undefined ? {} : { objc_class_label }),
+          })),
+        )
       : err(
           new AnalysisOutputError(
             tool,
@@ -707,13 +836,15 @@ export class EnhancedTools {
     signal?: AbortSignal,
     selectorOrigin?: ExecutionOptions["selectorOrigin"],
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
-    if (isAborted(signal)) return err(new AnalysisCancelledError(name));
+    if (isAborted(signal))
+      return err(new AnalysisCancelledError(name, { cause: signal?.reason }));
     const execution = await this.analysis.execute(name, arguments_, {
       ...(signal === undefined ? {} : { signal }),
       ...(selectorOrigin === undefined ? {} : { selectorOrigin }),
     });
     if (!execution.ok) return execution;
-    if (isAborted(signal)) return err(new AnalysisCancelledError(name));
+    if (isAborted(signal))
+      return err(new AnalysisCancelledError(name, { cause: signal?.reason }));
     return execution;
   }
 }

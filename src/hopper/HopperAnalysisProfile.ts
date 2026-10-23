@@ -3,12 +3,14 @@ import { createReadStream } from "node:fs";
 
 import type {
   AnalysisProfileResolution,
+  RetainedResourceScope,
   ProviderIdentity,
 } from "../application/AnalysisProvider.js";
 import { createAnalysisProfile } from "../domain/analysisProfile.js";
 import {
   isMachOFormat,
   isElfMetadataArchitecture,
+  type BinaryArchitecture,
   type BinaryTarget,
   type ElfMetadataArchitecture,
   type HeaderArchitecture,
@@ -19,11 +21,16 @@ import {
 } from "../domain/analysisErrorCore.js";
 import { BinaryTargetError } from "../domain/configurationErrors.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
-import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import {
+  machoTargetSelectionSchema,
+  type MachoTargetSelection,
+} from "../domain/apple/machoTargetSelection.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { err, ok, type Result } from "../domain/result.js";
 
 import {
   resolveHopperMachOImage,
+  type HopperMachOImageResolutionFileSystem,
   type HopperMachOImage,
 } from "./HopperMachOImage.js";
 
@@ -31,11 +38,32 @@ interface HopperProfileOptions {
   readonly launcherPath: string;
   readonly loaderArgsOverride: readonly string[];
   readonly provider: ProviderIdentity;
+  readonly resourceScope: RetainedResourceScope;
+  readonly imageFileSystem?: HopperMachOImageResolutionFileSystem;
   readonly signal?: AbortSignal;
 }
 
 /** Resolve Hopper open semantics without placing its CLI flags in BinaryTarget. */
 export const resolveHopperAnalysisProfile = async (
+  target: BinaryTarget,
+  options: HopperProfileOptions,
+): Promise<Result<AnalysisProfileResolution, AnalysisError>> => {
+  try {
+    return await options.resourceScope.run(() =>
+      resolveHopperAnalysisProfileInScope(target, options),
+    );
+  } catch (cause: unknown) {
+    return err(
+      cause instanceof AnalysisError
+        ? cause
+        : new ProviderAdapterError("hopper", "resolve_analysis_profile", {
+            cause,
+          }),
+    );
+  }
+};
+
+const resolveHopperAnalysisProfileInScope = async (
   target: BinaryTarget,
   options: HopperProfileOptions,
 ): Promise<Result<AnalysisProfileResolution, AnalysisError>> => {
@@ -54,12 +82,40 @@ export const resolveHopperAnalysisProfile = async (
   let preparedImage: HopperMachOImage | undefined;
   if (
     target.kind === "executable" &&
-    (machoContainer === "fat64" || machoContainer === "fat32") &&
+    machoContainer !== undefined &&
     options.loaderArgsOverride.length === 0
   ) {
-    const resolved = await resolveHopperMachOImage(target, options.signal);
+    const resolved = await resolveHopperMachOImage(target, {
+      resourceScope: options.resourceScope,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.imageFileSystem === undefined
+        ? {}
+        : { fileSystem: options.imageFileSystem }),
+    });
     if (!resolved.ok) return resolved;
     preparedImage = resolved.value;
+  }
+  let targetSelection: MachoTargetSelection | undefined;
+  if (preparedImage?.method === "thin_verified_copy") {
+    targetSelection = machoTargetSelectionSchema.parse({
+      kind: "macho-selected-image-v1",
+      container: "thin",
+      offset: 0,
+      byte_length: preparedImage.byte_length,
+      cpu_type: preparedImage.cpu_type,
+      cpu_subtype: preparedImage.cpu_subtype,
+      container_table_sha256: null,
+    });
+  } else if (preparedImage !== undefined) {
+    targetSelection = machoTargetSelectionSchema.parse({
+      kind: "macho-selected-image-v1",
+      container: "fat",
+      offset: preparedImage.source_offset,
+      byte_length: preparedImage.byte_length,
+      cpu_type: preparedImage.cpu_type,
+      cpu_subtype: preparedImage.cpu_subtype,
+      container_table_sha256: preparedImage.container_table_sha256,
+    });
   }
   const derived = hopperLoaderArgsForTarget(
     target,
@@ -93,6 +149,9 @@ export const resolveHopperAnalysisProfile = async (
       ...(preparedImage === undefined
         ? {}
         : { prepared_image: { ...preparedImage } }),
+      ...(targetSelection === undefined
+        ? {}
+        : { target_selection: targetSelection }),
       loader: {
         source:
           options.loaderArgsOverride.length === 0
@@ -115,10 +174,25 @@ const HOPPER_DECLINED_ARCHITECTURE_LABELS: Record<
   hexagon: "Hexagon",
 };
 
+/** Families with no verified Hopper lane, declined before any loader selection. */
+export type HopperDeclinedArchitecture =
+  | ElfMetadataArchitecture
+  | "hexagon"
+  | "arm64_32";
+
+export const isHopperDeclinedArchitecture = (
+  architecture: BinaryArchitecture,
+): architecture is HopperDeclinedArchitecture =>
+  isElfMetadataArchitecture(architecture) ||
+  architecture === "hexagon" ||
+  architecture === "arm64_32";
+
 export const hopperDeclinedArchitectureReason = (
-  architecture: ElfMetadataArchitecture | "hexagon",
+  architecture: HopperDeclinedArchitecture,
 ): string =>
-  `REA's Hopper adapter does not admit ${HOPPER_DECLINED_ARCHITECTURE_LABELS[architecture]} targets. Select a verified Ghidra ${HOPPER_DECLINED_ARCHITECTURE_LABELS[architecture]} profile instead.`;
+  architecture === "arm64_32"
+    ? "REA's Hopper adapter has no verified arm64_32 lane."
+    : `REA's Hopper adapter does not admit ${HOPPER_DECLINED_ARCHITECTURE_LABELS[architecture]} targets. Select a verified Ghidra ${HOPPER_DECLINED_ARCHITECTURE_LABELS[architecture]} profile instead.`;
 
 /** Derive Hopper's complete non-interactive CLI loader selection. */
 export const hopperLoaderArgsForTarget = (
@@ -134,7 +208,7 @@ export const hopperLoaderArgsForTarget = (
   if (target.format === "raw-binary")
     return err(new ProviderAdapterError("hopper", "resolve_analysis_profile"));
   const architecture = target.architecture;
-  if (isElfMetadataArchitecture(architecture) || architecture === "hexagon")
+  if (isHopperDeclinedArchitecture(architecture))
     return err(
       new AnalysisCapabilityUnavailableError(
         "hopper",
@@ -189,17 +263,23 @@ const readMachoMagic = async (
   signal?: AbortSignal,
 ): Promise<Result<number, AnalysisError>> => {
   if (signalIsAborted(signal))
-    return err(new AnalysisCancelledError("open_binary"));
+    return err(
+      new AnalysisCancelledError("open_binary", { cause: signal?.reason }),
+    );
   const stream = createReadStream(path, { start: 0, end: 3 });
+  const abortError = new Error("Caller cancelled Mach-O header read");
   const onAbort = (): void => {
-    stream.destroy();
+    stream.destroy(abortError);
   };
   signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   try {
     const chunks: Buffer[] = [];
     for await (const chunk of stream) chunks.push(Buffer.from(chunk));
     if (signalIsAborted(signal))
-      return err(new AnalysisCancelledError("open_binary"));
+      return err(
+        new AnalysisCancelledError("open_binary", { cause: signal?.reason }),
+      );
     const bytes = Buffer.concat(chunks);
     return bytes.length === 4
       ? ok(bytes.readUInt32BE(0))
@@ -210,8 +290,10 @@ const readMachoMagic = async (
           ),
         );
   } catch (cause: unknown) {
-    return signalIsAborted(signal)
-      ? err(new AnalysisCancelledError("open_binary"))
+    return cause === abortError
+      ? err(
+          new AnalysisCancelledError("open_binary", { cause: signal?.reason }),
+        )
       : err(
           new BinaryTargetError(
             path,
@@ -229,23 +311,31 @@ const sha256File = async (
   signal: AbortSignal | undefined,
 ): Promise<Result<string | undefined, AnalysisCancelledError>> => {
   if (signalIsAborted(signal))
-    return err(new AnalysisCancelledError("open_binary"));
+    return err(
+      new AnalysisCancelledError("open_binary", { cause: signal?.reason }),
+    );
   const stream = createReadStream(path);
+  const abortError = new Error("Caller cancelled launcher fingerprint read");
   const onAbort = (): void => {
-    stream.destroy();
+    stream.destroy(abortError);
   };
   signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   try {
     const hash = createHash("sha256");
     for await (const chunk of stream) hash.update(chunk);
     return signalIsAborted(signal)
-      ? err(new AnalysisCancelledError("open_binary"))
+      ? err(
+          new AnalysisCancelledError("open_binary", { cause: signal?.reason }),
+        )
       : ok(hash.digest("hex"));
   } catch (cause: unknown) {
-    // best-effort cleanup: unreadable targets mean no digest; abort still cancels.
-    void cause;
-    return signalIsAborted(signal)
-      ? err(new AnalysisCancelledError("open_binary"))
+    // Physical fingerprint failures are best-effort; only our own abort
+    // sentinel turns this optional observation into caller cancellation.
+    return cause === abortError
+      ? err(
+          new AnalysisCancelledError("open_binary", { cause: signal?.reason }),
+        )
       : ok(undefined);
   } finally {
     signal?.removeEventListener("abort", onAbort);

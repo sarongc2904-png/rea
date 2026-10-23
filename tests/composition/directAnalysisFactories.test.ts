@@ -10,26 +10,38 @@ import type { DirectAnalysisDependencies } from "../../src/application/DirectAna
 import type { NativeToolName } from "../../src/contracts/native/nativeToolContracts.js";
 import type { BinarySession } from "../../src/application/binary/BinarySession.js";
 import { observed } from "../fixtures/analysisExecution.js";
+import { createAnalysisProfile } from "../../src/domain/analysisProfile.js";
 import {
   createBinarySessionTargets,
   createTestBinarySession,
 } from "../fixtures/binarySession.js";
 
-const recordingFactories = (failure?: Error) => {
+const recordingFactories = (
+  failure?: Error,
+  profile?: ReturnType<typeof createAnalysisProfile>,
+) => {
   const sessions: BinarySession[] = [];
   let clientsClosed = 0;
   const createSession = () => {
-    const session = createTestBinarySession(() => ({
-      execute: (operation) => {
-        if (failure !== undefined && operation === "read_bytes")
-          return Promise.reject(failure);
-        return Promise.resolve(observed({ operation }));
-      },
-      close: () => {
-        clientsClosed += 1;
-        return Promise.resolve(resultOk(null));
-      },
-    }));
+    const session = createTestBinarySession(
+      () => ({
+        execute: (operation) => {
+          if (failure !== undefined && operation === "read_bytes")
+            return Promise.reject(failure);
+          return Promise.resolve(observed({ operation }));
+        },
+        close: () => {
+          clientsClosed += 1;
+          return Promise.resolve(resultOk(null));
+        },
+      }),
+      profile === undefined
+        ? {}
+        : {
+            resolveAnalysisProfile: () =>
+              Promise.resolve(resultOk({ profile })),
+          },
+    );
     sessions.push(session);
     return session;
   };
@@ -43,6 +55,57 @@ const recordingFactories = (failure?: Error) => {
   };
   return { dependencies, sessions, clientsClosed: () => clientsClosed };
 };
+
+it("requires a durable summary destination before acquiring a managed session", async () => {
+  const factories = recordingFactories();
+  const result = await runProviderAnalysis(
+    factories.dependencies,
+    "/fixture/missing.dll",
+    "inspect_managed_members",
+    {},
+    undefined,
+    undefined,
+    { detail: "summary" },
+  );
+  expect(result).toMatchObject({
+    code: "invalid_request",
+    details: {
+      operation: "inspect_managed_members",
+      issues: [{ path: ["evidence_bundle"], reason: "missing_argument" }],
+    },
+  });
+  expect(factories.sessions).toEqual([]);
+});
+
+it.each([
+  "inspect_macho",
+  "inventory_artifact",
+  "inspect_managed_artifact",
+] as const)(
+  "rejects delivery options for %s before selecting a provider",
+  async (tool) => {
+    const factories = recordingFactories();
+    const invocation = [
+      factories.dependencies,
+      "/fixture/missing",
+      tool,
+      {},
+      undefined,
+      undefined,
+      { detail: "summary", evidenceBundlePath: "/fixture/bundle.json" },
+    ] as const;
+    // @ts-expect-error JavaScript callers can bypass managed-members-only delivery.
+    const result = await runProviderAnalysis(...invocation);
+    expect(result).toMatchObject({
+      code: "invalid_request",
+      details: {
+        operation: tool,
+        issues: [{ path: ["delivery"], reason: "invalid_value" }],
+      },
+    });
+    expect(factories.sessions).toEqual([]);
+  },
+);
 
 describe("one-shot analysis factory boundary", () => {
   it("preserves thrown failures while releasing clients and cancellation listeners", async () => {
@@ -196,4 +259,24 @@ describe("one-shot analysis factory boundary", () => {
       expect(factories.clientsClosed()).toBe(1);
     },
   );
+});
+
+it("preserves a managed execution profile in direct analysis Evidence", async () => {
+  const [path] = await createBinarySessionTargets();
+  const profile = createAnalysisProfile(
+    {
+      id: "fixture",
+      name: "Fixture analysis provider",
+      version: "1",
+    },
+    { fixture: true },
+  );
+  const factories = recordingFactories(undefined, profile);
+  const evidence = await runProviderAnalysis(
+    factories.dependencies,
+    path,
+    "inspect_managed_artifact",
+    {},
+  );
+  expect(evidence).toMatchObject({ analysis_profile: profile });
 });
